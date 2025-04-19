@@ -7,11 +7,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -26,6 +28,9 @@ import (
 	"github.com/miekg/dns"
 	"golang.org/x/time/rate"
 )
+
+//go:embed static/*
+var staticFiles embed.FS
 
 // DNSType 定义 DNS 类型
 type DNSType string
@@ -1815,6 +1820,8 @@ func main() {
 
 	go syncFiles(media)
 
+	subFS, _ := fs.Sub(staticFiles, "static")
+	fs := http.FileServer(http.FS(subFS))
 	http.HandleFunc("/api/config", handleConfig)
 	http.HandleFunc("/api/paths", handlePaths)
 	http.HandleFunc("/api/paths/count", handlePathsCount)
@@ -1826,7 +1833,7 @@ func main() {
 	http.HandleFunc("/api/sync/stop", handleSyncStop)
 	http.HandleFunc("/api/config/get", handleConfigGet)
 	http.HandleFunc("/api/check-timestamp", handleCheckTimestamp)
-	http.Handle("/", http.FileServer(http.Dir(".")))
+	http.Handle("/", fs)
 
 	addLog("info", "服务器启动，监听端口 :8080")
 	err = http.ListenAndServe(":8080", nil)
