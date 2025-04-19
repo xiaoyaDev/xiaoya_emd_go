@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>小雅爬虫管理</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <h1>小雅爬虫管理 V1.0</h1>
+        <div class="top-controls">
+            <button class="theme-toggle" onclick="toggleTheme()">切换主题</button>
+        </div>
+        <div id="status" class="status"></div>
+
+        <div class="tabs">
+            <button class="tab-button active" data-tab="main">主界面</button>
+            <button class="tab-button" data-tab="logs">日志</button>
+            <button class="tab-button" data-tab="config">配置</button>
+        </div>
+
+        <div class="tab-content active" id="main-tab">
+            <div class="section">
+                <div class="section-title">同步状态</div>
+                <div id="syncStatus" class="sync-status">
+                    <div class="sync-info">
+                        <div><strong>状态：</strong><span id="syncRunningStatus">加载中...</span></div>
+                        <div><strong>消息：</strong><span id="syncMessage">加载中...</span></div>
+                        <div><strong>下次执行时间：</strong><span id="syncNextRun">-</span></div>
+                        <div><strong>同步间隔：</strong><span id="syncIntervalDisplay">-</span></div>
+                        <div><strong>本地数据包日期：</strong><span id="localTimestamp">-</span></div>
+                        <div><strong>快速校验：</strong><input type="checkbox" id="fastCheck" onchange="toggleFastCheck()"></div>
+                    </div>
+                    <div class="sync-controls">
+                        <button id="startSyncBtn" class="primary" onclick="startSync()"><i class="fas fa-play"></i> 开始同步</button>
+                        <button id="stopSyncBtn" class="danger" onclick="stopSync()"><i class="fas fa-stop"></i> 停止同步</button>
+                        <div class="sync-interval">
+                            <input type="number" id="syncInterval" min="1" max="24" step="1" placeholder="小时">
+                            <button class="primary" onclick="saveInterval()"><i class="fas fa-save"></i> 保存</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <div class="section-title">同步目录</div>
+                <div id="pathList"></div>
+                <button class="primary" onclick="savePaths()"><i class="fas fa-save"></i> 保存目录设置</button>
+            </div>
+        </div>
+
+        <div class="tab-content" id="logs-tab">
+            <div class="section">
+                <div class="section-title">系统日志</div>
+                <div class="log-controls" style="margin-bottom: 10px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center;">
+                    <button class="primary" onclick="debouncedRefreshLogs()"><i class="fas fa-sync"></i> 刷新</button>
+                    <button class="primary" onclick="exportLogs()"><i class="fas fa-download"></i> 导出</button>
+                    <button class="danger" onclick="clearLogs()"><i class="fas fa-trash"></i> 清空</button>
+                    <label for="logLimit">每页显示：</label>
+                    <select id="logLimit" onchange="debouncedRefreshLogs()">
+                        <option value="10">10</option>
+                        <option value="20">20</option>
+                        <option value="50">50</option>
+                        <option value="100" selected>100</option>
+                        <option value="200">200</option>
+                    </select>
+                    <label for="logFilter">筛选类型：</label>
+                    <select id="logFilter" onchange="debouncedRefreshLogs()">
+                        <option value="">全部</option>
+                        <option value="info">Info</option>
+                        <option value="warning">Warning</option>
+                        <option value="error">Error</option>
+                        <option value="success">Success</option>
+                    </select>
+                    <label for="logSearch">搜索：</label>
+                    <input type="text" id="logSearch" placeholder="输入关键词" oninput="debouncedRefreshLogs()">
+                    <label for="logRefreshInterval">刷新间隔：</label>
+                    <select id="logRefreshInterval" onchange="updateLogRefresh()">
+                        <option value="0" selected>手动刷新</option>
+                        <option value="1000">1秒</option>
+                        <option value="3000">3秒</option>
+                        <option value="5000">5秒</option>
+                    </select>
+                    <label for="logSizeInput">最大条目数：</label>
+                    <input type="number" id="logSizeInput" min="1" step="1" style="width: 80px;" placeholder="1000">
+                    <button class="primary" onclick="saveLogSize()"><i class="fas fa-save"></i> 保存</button>
+                    <div id="logMemoryInfo" style="font-size: 0.9rem;"></div>
+                </div>
+                <div class="log-container" id="logContainer"></div>
+                <div class="pagination" style="margin-top: 10px; display: flex; justify-content: center; gap: 5px;">
+                    <button class="primary" onclick="changePage(-1)"><i class="fas fa-chevron-left"></i> 上一页</button>
+                    <span id="pageInfo"></span>
+                    <button class="primary" onclick="changePage(1)">下一页 <i class="fas fa-chevron-right"></i></button>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-content" id="config-tab">
+            <div class="section">
+                <div class="section-title">服务器列表</div>
+                <div class="input-group">
+                    <label for="serverList">服务器地址（每行一个）：</label>
+                    <textarea id="serverList" placeholder="https://example1.com
+https://example2.com"></textarea>
+                    <button class="primary" onclick="saveServers()"><i class="fas fa-save"></i> 保存</button>
+                </div>
+            </div>
+
+            <div class="section">
+                <div class="section-title">网络配置</div>
+                <div class="input-group">
+                    <label>启用自定义 DNS：</label>
+                    <input type="checkbox" id="dnsEnabled" onchange="toggleDNSEnabled()">
+                </div>
+                <div class="input-group">
+                    <label for="dnsType">DNS 类型：</label>
+                    <select id="dnsType">
+                        <option value="doh">DoH (HTTPS)</option>
+                        <option value="dot">DoT (TLS)</option>
+                    </select>
+                </div>
+                <div class="input-group">
+                    <label for="dnsServer">DNS 服务器地址：</label>
+                    <input type="text" id="dnsServer" placeholder="1.1.1.1">
+                    <button class="primary" onclick="saveDNSConfig()"><i class="fas fa-save"></i> 保存</button>
+                </div>
+                <div class="input-group">
+                    <label>启用带宽限制：</label>
+                    <input type="checkbox" id="bandwidthLimitEnabled" onchange="toggleBandwidthLimitEnabled()">
+                </div>
+                <div class="input-group">
+                    <label for="bandwidthLimitMBps">带宽限制 (MB/s)：</label>
+                    <input type="number" id="bandwidthLimitMBps" min="0.1" step="0.1" placeholder="5.0">
+                    <button class="primary" onclick="saveBandwidthConfig()"><i class="fas fa-save"></i> 保存</button>
+                </div>
+                <div class="input-group">
+                    <label for="maxConcurrency">最大并发数：</label>
+                    <input type="number" id="maxConcurrency" min="1" step="1" placeholder="500">
+                    <button class="primary" onclick="saveConcurrencyConfig()"><i class="fas fa-save"></i> 保存</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script src="scripts.js"></script>
+</body>
+</html>
