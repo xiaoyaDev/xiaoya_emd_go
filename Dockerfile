@@ -20,6 +20,8 @@ RUN set -ex && \
     apk add --no-cache \
         bash \
         tini \
+        ca-certificates \
+        sqlite \
         tzdata && \
     rm -rf \
         /root/.cache \
