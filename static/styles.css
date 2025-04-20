@@ -57,7 +57,7 @@ body[data-theme="dark"] .sync-status { background: #3b4a5a; }
 body[data-theme="dark"] .log-container { background: #2c3e50; }
 .log-entry { display: flex; padding: 5px 0; border-bottom: 1px solid #dee2e6; align-items: flex-start; }
 body[data-theme="dark"] .log-entry { border-bottom: 1px solid #4a5e74; }
-.log-timestamp { color: #6c757d; width: 150px; flex-shrink: 0; white-space: nowrap; margin-right: 10px; }
+.log-timestamp { color: #6c757d; width: 170px; flex-shrink: 0; white-space: nowrap; margin-right: 10px; }
 .log-type { padding: 2px 6px; border-radius: 4px; margin-right: 8px; min-width: 50px; text-align: center; flex-shrink: 0; }
 .log-message { word-break: break-all; }
 .log-type-info { background: var(--info); color: white; }
@@ -72,14 +72,11 @@ body[data-theme="dark"] .log-entry { border-bottom: 1px solid #4a5e74; }
 .file-count-equal { color: var(--success); }
 .update-notice { color: var(--warning); margin-left: 8px; font-size: 0.9rem; font-weight: bold; }
 .log-controls select { padding: 5px; border-radius: 6px; margin-left: 5px; }
-.check-timestamp-btn { padding: 4px 8px; font-size: 0.8rem; background: linear-gradient(135deg, #17a2b8, #117a8b); color: white; border-radius: 4px; cursor: pointer; transition: all 0.3s; }
-.check-timestamp-btn:hover:not(:disabled) { background: linear-gradient(135deg, #117a8b, #0d5f6e); }
-.timestamp-status { font-size: 0.8rem; color: #6c757d; }
-.timestamp-checked { color: var(--success); }
-.timestamp-checking { color: var(--info); font-weight: bold; }
-.pagination button { padding: 6px 12px; font-size: 0.9rem;  }
-.pagination span {  padding: 6px 12px;  font-size: 0.9rem;  color: var(--dark); }
-body[data-theme="dark"] .pagination span { color: #e9ecef; }
+.sync-path-btn { padding: 4px 8px; font-size: 0.8rem; background: linear-gradient(135deg, #17a2b8, #117a8b); color: white; border-radius: 4px; cursor: pointer; transition: all 0.3s; }
+.sync-path-btn:hover:not(:disabled) { background: linear-gradient(135deg, #117a8b, #0d5f6e); }
+.pagination button { padding: 6px 12px; font-size: 0.9rem; }
+.pagination span, .pagination label, .pagination select { padding: 6px 12px; font-size: 0.9rem; color: var(--dark); }
+body[data-theme="dark"] .pagination span, body[data-theme="dark"] .pagination label, body[data-theme="dark"] .pagination select { color: #e9ecef; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 @media (max-width: 600px) {
@@ -96,15 +93,16 @@ body[data-theme="dark"] .pagination span { color: #e9ecef; }
     button { padding: 6px 10px; font-size: 0.8rem; }
     .sync-interval input { width: 50px; }
     .log-container { max-height: 200px; }
-    .log-timestamp { width: 120px; font-size: 0.7rem; margin-right: 8px; }
+    .log-timestamp { width: 140px; font-size: 0.7rem; margin-right: 8px; }
     .log-type { min-width: 40px; font-size: 0.7rem; }
     .checkbox-group { font-size: 0.8rem; flex-wrap: wrap; gap: 5px; }
     .file-count { font-size: 0.9rem; }
     .update-notice { font-size: 0.8rem; }
     .top-controls { top: 5px; right: 5px; }
-    .check-timestamp-btn { padding: 3px 6px; font-size: 0.7rem; }
-    .timestamp-status { font-size: 0.7rem; }
+    .sync-path-btn { padding: 3px 6px; font-size: 0.7rem; }
     .input-group { flex-direction: column; align-items: flex-start; }
     .input-group label { min-width: auto; }
     .input-group input, .input-group select { width: 100%; }
+    .pagination { flex-wrap: wrap; gap: 5px; }
+    .pagination select { width: 100px; }
 }

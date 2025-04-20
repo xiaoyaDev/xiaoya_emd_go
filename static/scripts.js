@@ -1,5 +1,6 @@
 let logRefreshTimer = null;
 let currentPage = 1;
+let currentSyncingPath = ''; // 记录当前同步路径
 
 function showStatus(message, isError = false) {
     const status = document.getElementById('status');
@@ -24,7 +25,11 @@ document.querySelectorAll('.tab-button').forEach(button => {
             debouncedRefreshLogs();
         } else if (this.dataset.tab === 'config') {
             loadConfigPage();
-        } else if (logRefreshTimer) {
+        } else if (this.dataset.tab === 'main') {
+            loadPaths(); // 刷新路径列表和按钮状态
+            getSyncStatus(); // 刷新同步状态
+        }
+        if (logRefreshTimer && this.dataset.tab !== 'logs') {
             clearTimeout(logRefreshTimer);
             logRefreshTimer = null;
         }
@@ -63,24 +68,46 @@ async function refreshLogs() {
     
     try {
         const data = await fetchAPI(url);
+        logContainer.innerHTML = ''; // 清空现有内容
         if (data.total === 0) {
             logContainer.innerHTML = '<div class="log-entry">暂无日志</div>';
         } else {
-            logContainer.innerHTML = '';
             data.logs.forEach(log => {
                 logContainer.innerHTML += `
                     <div class="log-entry">
-                        <div class="log-timestamp">${log.timestamp}  </div>
+                        <div class="log-timestamp">${log.timestamp}</div>
                         <div class="log-type log-type-${log.type}">${log.type.toUpperCase()}</div>
                         <div class="log-message">${log.message}</div>
                     </div>`;
             });
         }
-        logContainer.scrollTop = logContainer.scrollHeight;
+        // 确保在 DOM 更新后滚动到顶部，显示最新日志
+        requestAnimationFrame(() => {
+            logContainer.scrollTop = 0;
+        });
 
         const totalPages = Math.ceil(data.total / limit) || 1;
-        document.getElementById('pageInfo').textContent = `第 ${data.currentPage} 页 / 共 ${totalPages} 页 (总计 ${data.total} 条)`;
+        // 确保 currentPage 在有效范围内
+        if (currentPage < 1) currentPage = 1;
+        if (currentPage > totalPages) currentPage = totalPages;
+        
+        document.getElementById('pageInfo').textContent = `第 ${currentPage} 页 / 共 ${totalPages} 页 (总计 ${data.total} 条)`;
         document.getElementById('logMemoryInfo').textContent = `最大条目数: ${data.logBufferSize} 条，预计内存占用: ${data.estimatedMemory}`;
+        document.getElementById('prevPage').disabled = currentPage === 1;
+        document.getElementById('nextPage').disabled = currentPage >= totalPages;
+
+        // 更新跳转页下拉菜单
+        const jumpPageSelect = document.getElementById('jumpPage');
+        jumpPageSelect.innerHTML = '';
+        for (let i = 1; i <= totalPages; i++) {
+            const option = document.createElement('option');
+            option.value = i;
+            option.textContent = `第 ${i} 页`;
+            if (i === currentPage) {
+                option.selected = true;
+            }
+            jumpPageSelect.appendChild(option);
+        }
 
         const interval = parseInt(document.getElementById('logRefreshInterval').value);
         if (interval > 0 && document.querySelector('.tab-button[data-tab="logs"]').classList.contains('active')) {
@@ -119,6 +146,23 @@ function changePage(delta) {
     debouncedRefreshLogs();
 }
 
+function jumpToPage() {
+    const jumpPageSelect = document.getElementById('jumpPage');
+    const jumpPage = parseInt(jumpPageSelect.value);
+    const limit = parseInt(document.getElementById('logLimit').value);
+    const total = parseInt(document.getElementById('pageInfo').textContent.match(/总计 (\d+) 条/)[1] || 0);
+    const totalPages = Math.ceil(total / limit) || 1;
+
+    if (!isNaN(jumpPage) && jumpPage >= 1 && jumpPage <= totalPages) {
+        currentPage = jumpPage;
+        debouncedRefreshLogs();
+    } else {
+        // 如果页码无效，重置为当前页
+        jumpPageSelect.value = currentPage;
+        showStatus('无效的页码', true);
+    }
+}
+
 async function exportLogs() {
     try {
         const response = await fetch('/api/logs?action=export');
@@ -148,36 +192,41 @@ async function clearLogs() {
 }
 
 async function getSyncStatus() {
-    const status = await fetchAPI('/api/sync');
-    const config = await fetchAPI('/api/config/get');
-    const runningStatus = document.getElementById('syncRunningStatus');
-    const message = document.getElementById('syncMessage');
-    const nextRun = document.getElementById('syncNextRun');
-    const intervalDisplay = document.getElementById('syncIntervalDisplay');
-    const intervalInput = document.getElementById('syncInterval');
-    const localTimestamp = document.getElementById('localTimestamp');
-    const startBtn = document.getElementById('startSyncBtn');
-    const stopBtn = document.getElementById('stopSyncBtn');
+    try {
+        const status = await fetchAPI('/api/sync');
+        const config = await fetchAPI('/api/config/get');
+        const runningStatus = document.getElementById('syncRunningStatus');
+        const message = document.getElementById('syncMessage');
+        const nextRun = document.getElementById('syncNextRun');
+        const intervalDisplay = document.getElementById('syncIntervalDisplay');
+        const intervalInput = document.getElementById('syncInterval');
+        const localTimestamp = document.getElementById('localTimestamp');
+        const startBtn = document.getElementById('startSyncBtn');
+        const stopBtn = document.getElementById('stopSyncBtn');
 
-    if (status.checkingPath) {
-        runningStatus.textContent = '校验中';
-        runningStatus.className = 'sync-checking';
-        message.textContent = status.message;
-    } else {
-        runningStatus.textContent = status.isRunning ? '运行中' : '已停止';
-        runningStatus.className = status.isRunning ? 'sync-running' : 'sync-waiting';
-        message.textContent = status.message;
+        currentSyncingPath = status.syncingPath; // 更新当前同步路径
+
+        if (status.syncingPath) {
+            runningStatus.textContent = '同步中';
+            runningStatus.className = 'sync-checking';
+            message.textContent = status.message;
+        } else {
+            runningStatus.textContent = status.isRunning ? '运行中' : '已停止';
+            runningStatus.className = status.isRunning ? 'sync-running' : 'sync-waiting';
+            message.textContent = status.message;
+        }
+        nextRun.textContent = status.nextRun || '-';
+        intervalDisplay.textContent = status.interval ? `${status.interval} 小时` : '-';
+        if (!intervalInput.dataset.initialized) {
+            intervalInput.placeholder = status.interval ? `${status.interval}小时` : '小时';
+            intervalInput.dataset.initialized = 'true';
+        }
+        localTimestamp.textContent = config.scanListTime ? new Date(config.scanListTime).toLocaleString() : '未知';
+        startBtn.disabled = status.isRunning || status.syncingPath !== '';
+        stopBtn.disabled = !status.isRunning && status.syncingPath === '';
+    } catch (error) {
+        showStatus(`获取同步状态失败: ${error.message}`, true);
     }
-    nextRun.textContent = status.nextRun || '-';
-    intervalDisplay.textContent = status.interval ? `${status.interval} 小时` : '-';
-    if (!intervalInput.dataset.initialized) {
-        intervalInput.placeholder = status.interval ? `${status.interval}小时` : '小时';
-        intervalInput.dataset.initialized = 'true';
-    }
-    localTimestamp.textContent = config.scanListTime ? new Date(config.scanListTime).toLocaleString() : '未知';
-    document.getElementById('fastCheck').checked = !config.forceTimestampCheck;
-    startBtn.disabled = status.isRunning || status.checkingPath !== '';
-    stopBtn.disabled = !status.isRunning && status.checkingPath === '';
 }
 
 async function startSync() {
@@ -195,14 +244,149 @@ async function startSync() {
 
 async function stopSync() {
     try {
-        await fetchAPI('/api/sync/stop', { method: 'POST' });
-        showStatus('同步已停止');
+        const response = await fetchAPI('/api/sync/stop', { method: 'POST' });
+        if (response.status === 'ok') {
+            showStatus(currentSyncingPath ? `路径 ${currentSyncingPath} 同步已停止` : '主同步已停止');
+        }
+        currentSyncingPath = ''; // 清空同步路径
         getSyncStatus();
+        await loadPaths(); // 刷新按钮状态
         if (document.querySelector('.tab-button[data-tab="logs"]').classList.contains('active')) {
             setTimeout(debouncedRefreshLogs, 1000);
         }
     } catch (error) {
         showStatus(`停止失败: ${error.message}`, true);
+    }
+}
+
+async function syncPath(path) {
+    const btn = document.querySelector(`.sync-path-btn[data-path="${path}"]`);
+    btn.disabled = true;
+    console.log(`触发立即同步：${path}`);
+    try {
+        // 调用停止同步功能
+        console.log("请求停止主同步");
+        await stopSync(); // 复用 stopSync 逻辑
+        console.log("停止同步响应成功");
+
+        // 触发路径同步
+        console.log(`开始路径同步：${path}`);
+        document.querySelectorAll('.sync-path-btn').forEach(b => b.disabled = true);
+        const response = await fetchAPI('/api/sync/path', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path })
+        });
+
+        if (response.status === 'busy') {
+            showStatus('当前已有同步任务运行，请稍后再试', true);
+            console.log("同步任务忙碌，返回 busy");
+        } else if (response.status === 'stopped') {
+            showStatus(`目录 ${path} 同步被终止`);
+            console.log(`路径 ${path} 同步被终止`);
+        } else {
+            showStatus(`目录 ${path} 同步完成`);
+            console.log(`路径 ${path} 同步完成`);
+            await loadPaths(); // 刷新路径列表
+        }
+    } catch (error) {
+        showStatus(`同步失败: ${error.message}`, true);
+        console.error(`同步失败: ${error.message}`);
+    } finally {
+        currentSyncingPath = ''; // 清空同步路径
+        btn.disabled = false;
+        await getSyncStatus(); // 刷新按钮状态
+        await loadPaths(); // 确保 diff 更新
+        console.log("同步请求结束，恢复按钮状态");
+    }
+}
+
+async function loadPaths() {
+    try {
+        const { allPaths, activePaths, pathUpdateNotices } = await fetchAPI('/api/paths');
+        const pathCounts = await fetchAPI('/api/paths/count');
+        const serverCounts = await fetchAPI('/api/server-paths-count');
+        const pathList = document.getElementById('pathList');
+        pathList.innerHTML = allPaths.length ? '' : '<div class="checkbox-group">暂无目录</div>';
+        allPaths.forEach(path => {
+            const localCount = pathCounts[path] >= 0 ? pathCounts[path] : '未知';
+            const serverCount = serverCounts[path] >= 0 ? serverCounts[path] : '未知';
+            const diff = localCount !== '未知' && serverCount !== '未知' ? localCount - serverCount : null;
+            let diffText = '';
+            let diffClass = '';
+            if (diff !== null) {
+                if (diff > 0) {
+                    diffText = `(多${diff}个)`;
+                    diffClass = 'file-count-ahead';
+                } else if (diff < 0) {
+                    diffText = `(少${-diff}个)`;
+                    diffClass = 'file-count-behind';
+                } else {
+                    diffText = '(一致)';
+                    diffClass = 'file-count-equal';
+                }
+            }
+            const hasUpdate = pathUpdateNotices && pathUpdateNotices[path] ? '<span class="update-notice">有可更新数据!</span>' : '';
+            const isSyncing = currentSyncingPath === path;
+
+            pathList.innerHTML += `
+                <div class="checkbox-group">
+                    <input type="checkbox" id="path_${path}" ${activePaths.includes(path) ? 'checked' : ''}>
+                    <label for="path_${path}">${path}</label>
+                    <span class="file-count ${diffClass}" data-diff="${diff !== null ? diff : '未知'}">(本地: ${localCount}, 服务器: ${serverCount}) ${diffText}</span>
+                    <button class="sync-path-btn" data-path="${path}" onclick="syncPath('${path}')" ${isSyncing || diff === 0 ? 'disabled' : ''}>立即同步</button>
+                    ${hasUpdate}
+                </div>`;
+        });
+    } catch (error) {
+        showStatus(`加载路径失败: ${error.message}`, true);
+    }
+}
+
+async function savePaths() {
+    const activePaths = Array.from(document.querySelectorAll('#pathList input:checked'))
+        .map(cb => cb.id.replace('path_', ''));
+    try {
+        await fetchAPI('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ activePaths })
+        });
+        showStatus(`同步目录已保存 (${activePaths.length} 个)`);
+    } catch (error) {
+        showStatus(`保存失败: ${error.message}`, true);
+    }
+}
+
+async function saveInterval() {
+    const interval = parseInt(document.getElementById('syncInterval').value);
+    if (isNaN(interval) || interval < 1 || interval > 24) {
+        showStatus('同步间隔必须为 1-24 的整数', true);
+        return;
+    }
+    try {
+        await fetchAPI('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ interval })
+        });
+        showStatus(`同步间隔已设置为 ${interval} 小时`);
+        getSyncStatus();
+    } catch (error) {
+        showStatus(`保存失败: ${error.message}`, true);
+    }
+}
+
+async function refreshLocalData() {
+    try {
+        console.log("触发刷新本地数据");
+        await fetchAPI('/api/refresh-local', { method: 'POST' });
+        showStatus("本地文件数据库已刷新");
+        await loadPaths(); // 刷新路径列表
+        console.log("本地数据刷新完成");
+    } catch (error) {
+        showStatus(`刷新失败: ${error.message}`, true);
+        console.error(`刷新本地数据失败: ${error.message}`);
     }
 }
 
@@ -249,130 +433,6 @@ async function saveServers() {
         showStatus(`服务器列表已保存 (${servers.length} 个)`);
     } catch (error) {
         showStatus(`保存失败: ${error.message}`, true);
-    }
-}
-
-async function loadPaths() {
-    try {
-        const { allPaths, activePaths, pathUpdateNotices } = await fetchAPI('/api/paths');
-        const pathCounts = await fetchAPI('/api/paths/count');
-        const serverCounts = await fetchAPI('/api/server-paths-count');
-        const config = await fetchAPI('/api/config/get');
-        const pathList = document.getElementById('pathList');
-        pathList.innerHTML = allPaths.length ? '' : '<div class="checkbox-group">暂无目录</div>';
-        allPaths.forEach(path => {
-            const localCount = pathCounts[path] >= 0 ? pathCounts[path] : '未知';
-            const serverCount = serverCounts[path] >= 0 ? serverCounts[path] : '未知';
-            const diff = localCount !== '未知' && serverCount !== '未知' ? localCount - serverCount : null;
-            let diffText = '';
-            let diffClass = '';
-            if (diff !== null) {
-                if (diff > 0) {
-                    diffText = `(多${diff}个)`;
-                    diffClass = 'file-count-ahead';
-                } else if (diff < 0) {
-                    diffText = `(少${-diff}个)`;
-                    diffClass = 'file-count-behind';
-                } else {
-                    diffText = '(一致)';
-                    diffClass = 'file-count-equal';
-                }
-            }
-            const lastCheckTime = config.pathCheckTimestamps ? config.pathCheckTimestamps[path] : null;
-            const timestampText = lastCheckTime ? `${new Date(lastCheckTime).toLocaleString()} 已校验` : '校验时间戳';
-            const timestampClass = lastCheckTime ? 'timestamp-checked' : '';
-            const hasUpdate = pathUpdateNotices && pathUpdateNotices[path] ? '<span class="update-notice">有可更新数据!</span>' : '';
-
-            pathList.innerHTML += `
-                <div class="checkbox-group">
-                    <input type="checkbox" id="path_${path}" ${activePaths.includes(path) ? 'checked' : ''}>
-                    <label for="path_${path}">${path}</label>
-                    <span class="file-count ${diffClass}" data-diff="${diff !== null ? diff : '未知'}">(本地: ${localCount}, 服务器: ${serverCount}) ${diffText}</span>
-                    <button class="check-timestamp-btn" data-path="${path}" onclick="checkTimestamp('${path}')">校验时间戳</button>
-                    <span class="timestamp-status ${timestampClass}" id="timestamp_${path}">${timestampText}</span>
-                    ${hasUpdate}
-                </div>`;
-        });
-    } catch (error) {
-        showStatus(`加载路径失败: ${error.message}`, true);
-    }
-}
-
-async function savePaths() {
-    const activePaths = Array.from(document.querySelectorAll('#pathList input:checked'))
-        .map(cb => cb.id.replace('path_', ''));
-    try {
-        await fetchAPI('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ activePaths })
-        });
-        showStatus(`同步目录已保存 (${activePaths.length} 个)`);
-    } catch (error) {
-        showStatus(`保存失败: ${error.message}`, true);
-    }
-}
-
-async function checkTimestamp(path) {
-    const btn = document.querySelector(`.check-timestamp-btn[data-path="${path}"]`);
-    const timestampStatus = document.getElementById(`timestamp_${path}`);
-    btn.disabled = true;
-    timestampStatus.textContent = '校验中...';
-    timestampStatus.className = 'timestamp-status timestamp-checking';
-    try {
-        const response = await fetchAPI('/api/check-timestamp', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path })
-        });
-        if (response.status === 'busy') {
-            showStatus('当前已有校验任务运行，请稍后再试', true);
-        } else {
-            timestampStatus.textContent = `${new Date(response.lastCheckTime).toLocaleString()} 已校验`;
-            timestampStatus.className = 'timestamp-status timestamp-checked';
-            showStatus(`目录 ${path} 时间戳校验完成`);
-            loadPaths();
-        }
-    } catch (error) {
-        showStatus(`校验失败: ${error.message}`, true);
-        timestampStatus.textContent = '校验时间戳';
-        timestampStatus.className = 'timestamp-status';
-    } finally {
-        btn.disabled = false;
-    }
-}
-
-async function saveInterval() {
-    const interval = parseInt(document.getElementById('syncInterval').value);
-    if (isNaN(interval) || interval < 1 || interval > 24) {
-        showStatus('同步间隔必须为 1-24 的整数', true);
-        return;
-    }
-    try {
-        await fetchAPI('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ interval })
-        });
-        showStatus(`同步间隔已设置为 ${interval} 小时`);
-        getSyncStatus();
-    } catch (error) {
-        showStatus(`保存失败: ${error.message}`, true);
-    }
-}
-
-async function toggleFastCheck() {
-    const forceTimestampCheck = !document.getElementById('fastCheck').checked;
-    try {
-        await fetchAPI('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ forceTimestampCheck })
-        });
-        showStatus(`快速校验已${forceTimestampCheck ? '关闭' : '启用'}`);
-    } catch (error) {
-        showStatus(`保存失败: ${error.message}`, true);
-        document.getElementById('fastCheck').checked = !forceTimestampCheck;
     }
 }
 
@@ -447,7 +507,6 @@ async function saveDNSConfig() {
 async function loadBandwidthConfig() {
     try {
         const config = await fetchAPI('/api/config/get');
-        console.log('Loaded bandwidth config:', config); // 调试日志
         document.getElementById('bandwidthLimitEnabled').checked = config.bandwidthLimitEnabled || false;
         document.getElementById('bandwidthLimitMBps').value = config.bandwidthLimitMBps || 5.0;
     } catch (error) {
@@ -461,12 +520,9 @@ async function toggleBandwidthLimitEnabled() {
     const bandwidthLimitMBpsInput = document.getElementById('bandwidthLimitMBps');
     let bandwidthLimitMBps = parseFloat(bandwidthLimitMBpsInput.value);
 
-    // 如果值无效，使用默认值 5.0
     if (isNaN(bandwidthLimitMBps) || bandwidthLimitMBps <= 0) {
         bandwidthLimitMBps = 5.0;
     }
-
-    console.log('Toggle Bandwidth Limit:', { bandwidthLimitEnabled, bandwidthLimitMBps });
 
     if (bandwidthLimitEnabled && bandwidthLimitMBps <= 0) {
         showStatus('带宽限制值必须为正数', true);
@@ -483,10 +539,8 @@ async function toggleBandwidthLimitEnabled() {
                 bandwidthLimitMBps 
             })
         });
-        console.log('Save Bandwidth Response:', response);
         showStatus(`带宽限制已${bandwidthLimitEnabled ? '启用' : '关闭'}`);
     } catch (error) {
-        console.error('Toggle Bandwidth Limit Error:', error);
         showStatus(`保存带宽限制失败: ${error.message}`, true);
         checkbox.checked = !bandwidthLimitEnabled;
     }
@@ -498,12 +552,9 @@ async function saveBandwidthConfig() {
     const bandwidthLimitMBpsInput = document.getElementById('bandwidthLimitMBps');
     let bandwidthLimitMBps = parseFloat(bandwidthLimitMBpsInput.value);
 
-    // 如果值无效，使用默认值 5.0
     if (isNaN(bandwidthLimitMBps) || bandwidthLimitMBps <= 0) {
         bandwidthLimitMBps = 5.0;
     }
-
-    console.log('Save Bandwidth Config:', { bandwidthLimitEnabled, bandwidthLimitMBps });
 
     if (bandwidthLimitEnabled && bandwidthLimitMBps <= 0) {
         showStatus('带宽限制必须为正数', true);
@@ -519,10 +570,8 @@ async function saveBandwidthConfig() {
                 bandwidthLimitMBps 
             })
         });
-        console.log('Save Bandwidth Response:', response);
         showStatus(`带宽限制已保存: ${bandwidthLimitEnabled ? `${bandwidthLimitMBps} MB/s` : '关闭'}`);
     } catch (error) {
-        console.error('Save Bandwidth Config Error:', error);
         showStatus(`保存带宽限制失败: ${error.message}`, true);
     }
 }
@@ -530,7 +579,6 @@ async function saveBandwidthConfig() {
 async function loadConcurrencyConfig() {
     try {
         const config = await fetchAPI('/api/config/get');
-        console.log('Loaded concurrency config:', config); // 调试日志
         document.getElementById('maxConcurrency').value = config.maxConcurrency || 500;
     } catch (error) {
         showStatus(`加载并发配置失败: ${error.message}`, true);

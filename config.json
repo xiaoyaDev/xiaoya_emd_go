@@ -1,0 +1,57 @@
+{
+  "sPathsAll": [
+    "动漫/",
+    "每日更新/",
+    "测试/",
+    "电影/",
+    "电视剧/",
+    "纪录片/",
+    "纪录片（已刮削）/",
+    "综艺/",
+    "音乐/",
+    "📺画质演示测试（4K，8K，HDR，Dolby）/"
+  ],
+  "sPool": [
+    "https://icyou.eu.org/",
+    "https://emby.8.net.co/",
+    "https://emby.raydoom.tk/",
+    "https://embyxiaoya.laogl.top/",
+    "https://emby-data.bdbd.fun/",
+    "https://emby-data.ymschh.top/",
+    "https://emby-data.r2s.site/",
+    "https://emby-data.neversay.eu.org/",
+    "https://emby-data.800686.xyz/",
+    "https://emby-data.xn--yetq23gxma.org/",
+    "https://emby-data.younv.at/",
+    "https://emby.kaiserver.uk/",
+    "https://emby-data.wwwh.eu.org/",
+    "https://emby-data.f1rst.top/",
+    "https://emby-data.xnn.ee/",
+    "https://emby.xiaoya.pro/"
+  ],
+  "activePaths": [
+    "测试/"
+  ],
+  "interval": 12,
+  "scanListTime": "0001-01-01T00:00:00Z",
+  "dnsType": "doh",
+  "dnsServer": "https://1.1.1.1/dns-query",
+  "dnsEnabled": true,
+  "logSize": 50000,
+  "bandwidthLimitEnabled": false,
+  "bandwidthLimitMBps": 5,
+  "maxConcurrency": 100,
+  "pathUpdateNotices": {},
+  "serverPathCounts": {
+    "动漫/": 0,
+    "每日更新/": 0,
+    "测试/": 0,
+    "电影/": 0,
+    "电视剧/": 0,
+    "纪录片/": 0,
+    "纪录片（已刮削）/": 0,
+    "综艺/": 0,
+    "音乐/": 0,
+    "📺画质演示测试（4K，8K，HDR，Dolby）/": 0
+  }
+}

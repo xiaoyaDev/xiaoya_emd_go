@@ -9,7 +9,7 @@
 </head>
 <body>
     <div class="container">
-        <h1>小雅爬虫管理 V1.0</h1>
+        <h1>小雅爬虫管理 V1.1</h1>
         <div class="top-controls">
             <button class="theme-toggle" onclick="toggleTheme()">切换主题</button>
         </div>
@@ -31,7 +31,6 @@
                         <div><strong>下次执行时间：</strong><span id="syncNextRun">-</span></div>
                         <div><strong>同步间隔：</strong><span id="syncIntervalDisplay">-</span></div>
                         <div><strong>本地数据包日期：</strong><span id="localTimestamp">-</span></div>
-                        <div><strong>快速校验：</strong><input type="checkbox" id="fastCheck" onchange="toggleFastCheck()"></div>
                     </div>
                     <div class="sync-controls">
                         <button id="startSyncBtn" class="primary" onclick="startSync()"><i class="fas fa-play"></i> 开始同步</button>
@@ -48,6 +47,7 @@
                 <div class="section-title">同步目录</div>
                 <div id="pathList"></div>
                 <button class="primary" onclick="savePaths()"><i class="fas fa-save"></i> 保存目录设置</button>
+                <button class="primary" onclick="refreshLocalData()"><i class="fas fa-sync"></i> 刷新本地数据</button>
             </div>
         </div>
 
@@ -89,10 +89,14 @@
                     <div id="logMemoryInfo" style="font-size: 0.9rem;"></div>
                 </div>
                 <div class="log-container" id="logContainer"></div>
-                <div class="pagination" style="margin-top: 10px; display: flex; justify-content: center; gap: 5px;">
-                    <button class="primary" onclick="changePage(-1)"><i class="fas fa-chevron-left"></i> 上一页</button>
+                <div class="pagination" style="margin-top: 10px; display: flex; justify-content: center; gap: 5px; align-items: center;">
+                    <button class="primary" onclick="changePage(-1)" id="prevPage"><i class="fas fa-chevron-left"></i> 上一页</button>
                     <span id="pageInfo"></span>
-                    <button class="primary" onclick="changePage(1)">下一页 <i class="fas fa-chevron-right"></i></button>
+                    <button class="primary" onclick="changePage(1)" id="nextPage">下一页 <i class="fas fa-chevron-right"></i></button>
+                    <label for="jumpPage">跳转到：</label>
+                    <select id="jumpPage" onchange="jumpToPage()" style="padding: 5px; border-radius: 6px;">
+                        <option value="1">第 1 页</option>
+                    </select>
                 </div>
             </div>
         </div>
