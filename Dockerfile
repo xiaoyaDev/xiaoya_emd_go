@@ -35,5 +35,3 @@ WORKDIR /app
 ENTRYPOINT ["tini", "-g", "--", "/app/xiaoya_emd"]
 
 CMD ["--media", "/media"]
-
-EXPOSE 8080

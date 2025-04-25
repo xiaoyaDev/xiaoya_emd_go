@@ -739,8 +739,13 @@ func handleRefreshLocal(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// scanLocalFiles 扫描本地文件并生成数据库
+// scanLocalFiles 扫描本地文件并生成数据库，跳过字幕文件和空文件夹
 func scanLocalFiles(mediaDir, dbPath string) error {
+	// 定义需要跳过的字幕文件扩展名
+	skipExtensions := map[string]struct{}{
+		".srt": {}, ".ass": {}, ".vtt": {}, ".sub": {},
+	}
+
 	// 检查数据库是否存在
 	_, statErr := os.Stat(dbPath)
 	isNewDB := os.IsNotExist(statErr)
@@ -775,7 +780,7 @@ func scanLocalFiles(mediaDir, dbPath string) error {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	// 统计所有目录的总文件数
+	// 统计所有目录的总文件数，跳过字幕文件
 	for _, path := range paths {
 		wg.Add(1)
 		go func(p string) {
@@ -786,6 +791,11 @@ func scanLocalFiles(mediaDir, dbPath string) error {
 					return err
 				}
 				if !info.IsDir() {
+					// 检查是否为字幕文件
+					ext := strings.ToLower(filepath.Ext(filePath))
+					if _, skip := skipExtensions[ext]; skip {
+						return nil // 跳过字幕文件
+					}
 					mu.Lock()
 					totalFiles++
 					mu.Unlock()
@@ -800,7 +810,7 @@ func scanLocalFiles(mediaDir, dbPath string) error {
 	wg.Wait()
 
 	if totalFiles == 0 {
-		addLog("info", "指定目录中没有文件，数据库生成完成")
+		addLog("info", "数据库生成完成")
 		return nil
 	}
 
@@ -823,7 +833,7 @@ func scanLocalFiles(mediaDir, dbPath string) error {
 		}
 	}
 
-	// 扫描每个目录并插入数据库
+	// 扫描每个目录并插入数据库，跳过字幕文件
 	for _, path := range paths {
 		dirPath := filepath.Join(mediaDir, path)
 		err := filepath.Walk(dirPath, func(filePath string, info os.FileInfo, err error) error {
@@ -831,7 +841,12 @@ func scanLocalFiles(mediaDir, dbPath string) error {
 				return err
 			}
 			if info.IsDir() {
-				return nil
+				return nil // 跳过目录（包括空文件夹）
+			}
+			// 检查是否为字幕文件
+			ext := strings.ToLower(filepath.Ext(filePath))
+			if _, skip := skipExtensions[ext]; skip {
+				return nil // 跳过字幕文件
 			}
 			relativePath, err := filepath.Rel(mediaDir, filePath)
 			if err != nil {
@@ -1307,7 +1322,6 @@ func syncFiles(media *string) {
 
 		// 创建上下文以支持取消
 		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
 
 		// 监听停止信号
 		go func() {
@@ -1324,6 +1338,10 @@ func syncFiles(media *string) {
 
 		// 执行同步
 		successFiles, failedFiles, err := syncFilesCore(ctx, mediaDir, servers, toUpdate, toDelete, maxConcurrency, true)
+
+		// 显式调用 cancel() 清理上下文
+		cancel()
+
 		if err != nil && err != context.Canceled {
 			addLog("error", fmt.Sprintf("核心同步失败：%v", err))
 			continue
@@ -1982,15 +2000,6 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 	if newConfig.SPathsAll != nil {
 		config.SPathsAll = *newConfig.SPathsAll
 	}
-	if newConfig.SPool != nil {
-		if len(*newConfig.SPool) == 0 {
-			configMu.Unlock()
-			http.Error(w, "服务器列表不能为空", http.StatusBadRequest)
-			return
-		}
-		config.SPool = *newConfig.SPool
-		addLog("info", fmt.Sprintf("服务器地址保存成功，共 %d 个", len(config.SPool)))
-	}
 	if newConfig.ActivePaths != nil {
 		config.ActivePaths = *newConfig.ActivePaths
 		addLog("info", fmt.Sprintf("同步目录保存成功，共 %d 个", len(config.ActivePaths)))
@@ -2314,6 +2323,91 @@ func handleConfigGet(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(config)
 }
 
+// filterValidServers 过滤无效的服务器 URL
+func filterValidServers(servers []string) []string {
+	var validServers []string
+	for _, server := range servers {
+		server = strings.TrimSpace(server)
+		if server == "" {
+			continue
+		}
+		if !strings.HasPrefix(server, "http://") && !strings.HasPrefix(server, "https://") {
+			server = "https://" + server
+		}
+		if _, err := url.ParseRequestURI(server); err == nil {
+			validServers = append(validServers, server)
+		}
+	}
+	return validServers
+}
+
+// filterValidPaths 过滤无效的目录路径并规范化
+func filterValidPaths(paths []string) []string {
+	var validPaths []string
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		// 清理非法字符并确保路径以 / 结尾
+		path = cleanFileName(path)
+		if !strings.HasSuffix(path, "/") {
+			path += "/"
+		}
+		validPaths = append(validPaths, path)
+	}
+	// 去重
+	uniquePaths := make([]string, 0, len(validPaths))
+	seen := make(map[string]bool)
+	for _, path := range validPaths {
+		if !seen[path] {
+			seen[path] = true
+			uniquePaths = append(uniquePaths, path)
+		}
+	}
+	return uniquePaths
+}
+
+// intersectPaths 返回两个路径切片的交集
+func intersectPaths(active, all []string) []string {
+	allSet := make(map[string]bool)
+	for _, path := range all {
+		allSet[path] = true
+	}
+	var result []string
+	for _, path := range active {
+		if allSet[path] {
+			result = append(result, path)
+		}
+	}
+	return result
+}
+
+// validateMediaDir 验证 media 目录是否有效
+func validateMediaDir(mediaDir string) error {
+	// 检查目录是否存在
+	stat, err := os.Stat(mediaDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("媒体目录 %s 不存在", mediaDir)
+		}
+		return fmt.Errorf("检查媒体目录 %s 失败：%v", mediaDir, err)
+	}
+	if !stat.IsDir() {
+		return fmt.Errorf("媒体目录 %s 不是一个目录", mediaDir)
+	}
+
+	// 检查是否存在“每日更新”文件夹
+	dailyUpdatePath := filepath.Join(mediaDir, "每日更新")
+	if _, err := os.Stat(dailyUpdatePath); os.IsNotExist(err) {
+		return fmt.Errorf("媒体目录 %s 下缺少 '每日更新' 文件夹", mediaDir)
+	} else if err != nil {
+		return fmt.Errorf("检查 '每日更新' 文件夹失败：%v", err)
+	}
+
+	return nil
+}
+
 func main() {
 	// 初始化东八区时区
 	var err error
@@ -2328,13 +2422,91 @@ func main() {
 		fmt.Fprintf(os.Stderr, "加载配置文件失败：%v\n", err)
 		os.Exit(1)
 	}
+	// 下载服务器列表并更新 sPool
+	fmt.Fprintf(os.Stdout, "尝试更新爬虫服务器列表,请稍等...\n")
+	resp, err := http.Get("https://docker.xiaoya.pro/crawler_sites.list")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "下载服务器列表失败：%v，使用默认列表.\n", err)
+	} else {
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "读取服务器列表失败：%v，使用默认列表.\n", err)
+			} else {
+				servers := strings.Split(strings.TrimSpace(string(body)), "\n")
+				servers = filterValidServers(servers)
+				if len(servers) > 0 {
+					configMu.Lock()
+					config.SPool = servers
+					configMu.Unlock()
+					if err := saveConfig(); err != nil {
+						fmt.Fprintf(os.Stderr, "保存服务器列表到 配置文件 失败：%v\n", err)
+					} else {
+						fmt.Fprintf(os.Stdout, "服务器列表更新成功，共 %d 个服务器\n", len(servers))
+					}
+				} else {
+					fmt.Fprintf(os.Stderr, "使用默认服务器列表\n")
+				}
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "下载服务器列表失败，状态码：%d，使用默认列表.\n", resp.StatusCode)
+		}
+	}
+
+	// 下载目录列表并更新 sPathsAll
+	fmt.Fprintf(os.Stdout, "尝试更新媒体列表,请稍等...\n")
+	resp, err = http.Get("https://docker.xiaoya.pro/crawler_dir.txt")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "下载目录列表失败：%v，使用默认列表.\n", err)
+	} else {
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "读取目录列表失败：%v，使用默认列表.\n", err)
+			} else {
+				paths := strings.Split(strings.TrimSpace(string(body)), "\n")
+				paths = filterValidPaths(paths)
+				if len(paths) > 0 {
+					configMu.Lock()
+					config.SPathsAll = paths
+					// 确保 ActivePaths 只包含 sPathsAll 中的路径
+					config.ActivePaths = intersectPaths(config.ActivePaths, paths)
+					configMu.Unlock()
+					if err := saveConfig(); err != nil {
+						fmt.Fprintf(os.Stderr, "保存目录列表到配置文件失败：%v\n", err)
+					} else {
+						fmt.Fprintf(os.Stdout, "目录列表更新成功，共 %d 个目录\n", len(paths))
+					}
+				} else {
+					fmt.Fprintf(os.Stderr, "使用默认目录列表\n")
+				}
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "下载目录列表失败，状态码：%d，使用默认列表.\n", resp.StatusCode)
+		}
+	}
 
 	logsMu.Lock()
 	logs = ring.New(config.LogSize) // 修改：使用 config.LogSize
 	logsMu.Unlock()
 
 	media := flag.String("media", "", "存储下载媒体文件的路径（必须）")
+	port := flag.Int("port", 8080, "HTTP 服务器端口（默认 8080）")
 	flag.Parse()
+
+	// 验证端口有效性
+	if *port < 1 || *port > 65535 {
+		fmt.Fprintf(os.Stderr, "端口 %d 无效，必须在 1-65535 范围内\n", *port)
+		os.Exit(1)
+	}
+	// 检查 media 目录有效性
+	if err := validateMediaDir(*media); err != nil {
+		fmt.Fprintf(os.Stderr, "无效的媒体目录：%v\n", err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stdout, "媒体目录 %s 验证通过\n", *media)
 
 	// 初始化数据库连接
 	if *media != "" {
@@ -2356,11 +2528,9 @@ func main() {
 		}
 		dbMu.Unlock()
 	}
-
 	initHttpClient()
 
 	addLog("info", "程序初始化完成，开始后台同步")
-
 	go syncFiles(media)
 
 	subFS, _ := fs.Sub(staticFiles, "static")
@@ -2379,10 +2549,12 @@ func main() {
 	http.HandleFunc("/api/refresh-local", handleRefreshLocal)
 	http.Handle("/", fs)
 
-	fmt.Fprintf(os.Stdout, "服务器启动，页面端口 :8080\n")
-	err = http.ListenAndServe(":8080", nil)
+	addr := fmt.Sprintf(":%d", *port)
+	fmt.Fprintf(os.Stdout, "页面已启动，请访问端口 %d\n", *port)
+	err = http.ListenAndServe(addr, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "服务器启动失败：%v\n", err)
+		addLog("error", fmt.Sprintf("服务器启动失败（端口 %d）：%v", *port, err))
 		// 关闭数据库连接
 		dbMu.Lock()
 		if localDB != nil {

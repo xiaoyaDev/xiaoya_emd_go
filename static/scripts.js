@@ -9,10 +9,16 @@ function showStatus(message, isError = false) {
     status.style.display = 'block';
     setTimeout(() => status.style.display = 'none', 3000);
 }
-
+// 初始化主题
+function initTheme() {
+    const savedTheme = localStorage.getItem('theme') || ''; // 默认亮色（空字符串）
+    document.body.dataset.theme = savedTheme;
+}
+// 切换主题
 function toggleTheme() {
     const body = document.body;
     body.dataset.theme = body.dataset.theme === 'dark' ? '' : 'dark';
+    localStorage.setItem('theme', body.dataset.theme); // 保存主题
 }
 
 document.querySelectorAll('.tab-button').forEach(button => {
@@ -418,7 +424,7 @@ async function saveLogSize() {
     }
 }
 
-async function saveServers() {
+/*async function saveServers() {
     const servers = document.getElementById('serverList').value.trim().split('\n').filter(s => s);
     if (!servers.length) {
         showStatus('服务器列表不能为空', true);
@@ -435,7 +441,7 @@ async function saveServers() {
         showStatus(`保存失败: ${error.message}`, true);
     }
 }
-
+*/
 async function loadConfigPage() {
     await loadServers();
     await loadDNSConfig();
@@ -604,6 +610,7 @@ async function saveConcurrencyConfig() {
 }
 
 window.onload = () => {
+    initTheme(); // 初始化主题
     getSyncStatus();
     loadPaths();
     setInterval(getSyncStatus, 5000);

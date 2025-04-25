@@ -9,7 +9,7 @@
 </head>
 <body>
     <div class="container">
-        <h1>小雅爬虫管理 V1.1</h1>
+        <h1>小雅爬虫管理 V1.2</h1>
         <div class="top-controls">
             <button class="theme-toggle" onclick="toggleTheme()">切换主题</button>
         </div>
@@ -106,9 +106,8 @@
                 <div class="section-title">服务器列表</div>
                 <div class="input-group">
                     <label for="serverList">服务器地址（每行一个）：</label>
-                    <textarea id="serverList" placeholder="https://example1.com
+                    <textarea id="serverList" readonly placeholder="https://example1.com
 https://example2.com"></textarea>
-                    <button class="primary" onclick="saveServers()"><i class="fas fa-save"></i> 保存</button>
                 </div>
             </div>
 
@@ -148,5 +147,12 @@ https://example2.com"></textarea>
         </div>
     </div>
     <script src="scripts.js"></script>
+    <footer class="telegram-footer">
+        <p>
+            <a href="https://t.me/xiaoyaliu00" target="_blank" class="telegram-link">
+                <img src="/favicon.ico" alt="Telegram Icon" class="telegram-icon"> xiaoya官方群聊
+            </a>
+        </p>
+    </footer>
 </body>
 </html>

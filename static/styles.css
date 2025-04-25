@@ -105,4 +105,59 @@ body[data-theme="dark"] .pagination span, body[data-theme="dark"] .pagination la
     .input-group input, .input-group select { width: 100%; }
     .pagination { flex-wrap: wrap; gap: 5px; }
     .pagination select { width: 100px; }
+    .telegram-footer { padding: 15px;  font-size: 0.9rem;  min-height: 50px;}
+    .telegram-icon {  width: 14px; height: 14px; }
+}
+
+/* 页脚样式 */
+.telegram-footer {
+    display: flex;
+    justify-content: center; /* 水平居中 */
+    align-items: center; /* 垂直居中 */
+    text-align: center;
+    padding: 20px;
+    margin-top: 20px;
+    font-size: 1rem;
+    min-height: 60px; /* 确保垂直居中有空间 */
+    width: 100%; /* 占满宽度 */
+}
+
+/* Telegram 链接样式 */
+.telegram-link {
+    color: #0088cc; /* Telegram 品牌色 */
+    text-decoration: none;
+    font-weight: bold;
+    transition: color 0.3s ease;
+    display: inline-flex; /* 使图标和文字对齐 */
+    align-items: center; /* 垂直居中对齐 */
+}
+
+.telegram-link:hover {
+    color: #00aced; /* 悬停时变亮 */
+}
+
+/* Telegram 图标样式 */
+.telegram-icon {
+    width: 16px; /* 图标大小 */
+    height: 16px;
+    margin-right: 5px; /* 图标与文字间距 */
+    vertical-align: middle; /* 确保与文字对齐 */
+}
+
+/* 适配亮色主题 */
+body[data-theme=""] .telegram-footer {
+    background: #f8f9fa; /* 与亮色主题协调 */
+    color: #333;
+}
+
+/* 适配暗色主题 */
+body[data-theme="dark"] .telegram-footer {
+    background: #1a1a1a; /* 暗色背景 */
+    color: #e9ecef;
+}
+body[data-theme="dark"] .telegram-link {
+    color: #4dabf7; /* 暗色主题下的链接颜色 */
+}
+body[data-theme="dark"] .telegram-link:hover {
+    color: #74c0fc;
 }
