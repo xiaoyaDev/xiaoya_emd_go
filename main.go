@@ -23,14 +23,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jmoiron/sqlx"
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/miekg/dns"
 	"golang.org/x/time/rate"
 )
-
-//go:embed static/*
-var staticFiles embed.FS
 
 // DNSType 定义 DNS 类型
 type DNSType string
@@ -57,6 +52,7 @@ type Config struct {
 	MaxConcurrency        int             `json:"maxConcurrency"`
 	PathUpdateNotices     map[string]bool `json:"pathUpdateNotices"`
 	ServerPathCounts      map[string]int  `json:"serverPathCounts"`
+	LocalPathCounts       map[string]int  `json:"localPathCounts"`
 }
 
 // LogEntry 定义日志条目结构
@@ -69,13 +65,10 @@ type LogEntry struct {
 
 // SyncState 定义同步状态结构
 type SyncState struct {
-	Running      bool
-	Trigger      chan struct{}
-	LastStart    time.Time
-	SyncingPath  string
-	SyncDone     chan struct{} // 通知主同步退出
-	StopPathSync chan struct{} // 通知路径同步停止
-	FromPathSync bool          // 标记是否从路径同步触发
+	Running   bool
+	Trigger   chan struct{}
+	LastStart time.Time
+	SyncDone  chan struct{} // 通知主同步退出
 }
 
 // ServerInfo 定义服务器信息结构
@@ -90,31 +83,32 @@ type FileInfo struct {
 	Timestamp int64
 }
 
-// DBFileInfo 定义数据库文件信息结构
-type DBFileInfo struct {
-	Path      string `db:"path"`
-	Timestamp int64  `db:"timestamp"`
+// FileInfoMap 定义文件信息映射类型
+type FileInfoMap map[string]int64 // key: 路径, value: 时间戳
+
+// LocalFileInfo 结构体整合路径计数等元数据
+type LocalFileInfo struct {
+	Files  FileInfoMap
+	Counts map[string]int
 }
 
 // 全局变量
 var (
-	localDB    *sqlx.DB
-	tempDB     *sqlx.DB
-	dbMu       sync.Mutex
 	config     Config
 	configMu   sync.RWMutex
 	httpClient *http.Client
 	logs       *ring.Ring
 	logsMu     sync.Mutex
 	syncState  = SyncState{
-		Running:      true,
-		Trigger:      make(chan struct{}, 1),
-		SyncDone:     make(chan struct{}),
-		StopPathSync: make(chan struct{}),
-		FromPathSync: false, // 初始化 FromPathSync
+		Running:  true,
+		Trigger:  make(chan struct{}, 1),
+		SyncDone: make(chan struct{}),
 	}
-	syncStateMu sync.Mutex
-	shanghaiLoc *time.Location // 东八区时区
+	//go:embed static/*
+	staticFiles    embed.FS
+	syncStateMu    sync.Mutex
+	shanghaiLoc    *time.Location      // 东八区时区
+	intervalChange = make(chan int, 1) // interval 变更通道
 )
 
 // CustomResolver 自定义 DNS 解析器
@@ -131,7 +125,6 @@ func formatTime(t time.Time) string {
 	}
 	return t.In(shanghaiLoc).Format(TimeFormatStandard)
 }
-
 func (r *CustomResolver) LookupHost(ctx context.Context, hostname string) ([]string, error) {
 	msg := new(dns.Msg)
 	msg.SetQuestion(dns.Fqdn(hostname), dns.TypeA)
@@ -188,7 +181,6 @@ func (r *CustomResolver) LookupHost(ctx context.Context, hostname string) ([]str
 	}
 	return net.DefaultResolver.LookupHost(ctx, hostname)
 }
-
 func extractIPs(msg *dns.Msg) []string {
 	var ips []string
 	for _, ans := range msg.Answer {
@@ -309,7 +301,6 @@ func initHttpClient() {
 			Server:     dnsServer,
 			HTTPClient: dohClient,
 		}
-		addLog("info", fmt.Sprintf("开始测试自定义 DNS (%s: %s)", dnsType, dnsServer))
 		testedType, err := testDNS(resolver, dnsType)
 		configMu.Lock()
 		if err != nil {
@@ -385,7 +376,6 @@ func (r *limitedReader) Read(p []byte) (n int, err error) {
 	err = r.limiter.WaitN(r.ctx, n)
 	return n, err
 }
-
 func (r *limitedReader) Close() error {
 	return r.reader.Close()
 }
@@ -470,8 +460,37 @@ func getLogs(limit, page int, filter, search string) ([]LogEntry, int) {
 
 // loadConfig 从 config.json 加载配置
 func loadConfig() error {
-	configFile, err := os.Open("config.json")
+	mediaDir := flag.Lookup("media").Value.String()
+	configFilePath := filepath.Join(mediaDir, "config.json")
+	configFile, err := os.Open(configFilePath)
 	if err != nil {
+		// 检查根目录的 config.json
+		rootConfigPath := "config.json"
+		rootConfigFile, rootErr := os.Open(rootConfigPath)
+		if rootErr == nil {
+			// 根目录存在 config.json，拷贝到 mediaDir
+			defer rootConfigFile.Close()
+			// 确保 mediaDir 存在
+			if err := os.MkdirAll(mediaDir, 0755); err != nil {
+				return fmt.Errorf("创建媒体目录 %s 失败：%v", mediaDir, err)
+			}
+			// 读取根目录 config.json 内容
+			var rootConfig Config
+			if err := json.NewDecoder(rootConfigFile).Decode(&rootConfig); err != nil {
+				return fmt.Errorf("解析根目录配置文件 %s 失败：%v", rootConfigPath, err)
+			}
+			// 初始化 LocalPathCounts
+			if rootConfig.LocalPathCounts == nil {
+				rootConfig.LocalPathCounts = make(map[string]int)
+			}
+			// 保存到 mediaDir
+			configMu.Lock()
+			config = rootConfig
+			configMu.Unlock()
+			addLog("info", fmt.Sprintf("配置文件 %s 未找到，从根目录 %s 拷贝默认配置", configFilePath, rootConfigPath))
+			return saveConfig()
+		}
+		// 根目录也没有 config.json，创建默认配置
 		configMu.Lock()
 		config = Config{
 			Interval:              1,
@@ -484,9 +503,10 @@ func loadConfig() error {
 			MaxConcurrency:        500,
 			PathUpdateNotices:     make(map[string]bool),
 			ServerPathCounts:      make(map[string]int),
+			LocalPathCounts:       make(map[string]int), // 初始化 LocalPathCounts
 		}
 		configMu.Unlock()
-		addLog("info", "配置文件未找到，已创建默认配置")
+		addLog("info", fmt.Sprintf("配置文件 %s 和根目录配置文件均未找到，已创建默认配置", configFilePath))
 		return saveConfig()
 	}
 	defer configFile.Close()
@@ -511,6 +531,9 @@ func loadConfig() error {
 	}
 	if newConfig.ServerPathCounts == nil {
 		newConfig.ServerPathCounts = make(map[string]int)
+	}
+	if newConfig.LocalPathCounts == nil {
+		newConfig.LocalPathCounts = make(map[string]int)
 	}
 
 	logsMu.Lock()
@@ -541,7 +564,9 @@ func loadConfig() error {
 
 // saveConfig 保存配置到 config.json
 func saveConfig() error {
-	configFile, err := os.Create("config.json")
+	mediaDir := flag.Lookup("media").Value.String()
+	configFilePath := filepath.Join(mediaDir, "config.json")
+	configFile, err := os.Create(configFilePath)
 	if err != nil {
 		return err
 	}
@@ -677,41 +702,7 @@ func pickBestServers(pool []string) []ServerInfo {
 	return result
 }
 
-// initLocalDB 初始化本地数据库
-func initLocalDB(dbPath string) (*sqlx.DB, error) {
-	db, err := sqlx.Open("sqlite3", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("打开数据库失败：%v", err)
-	}
-
-	// 启用 WAL 模式以支持并发读写
-	_, err = db.Exec(`PRAGMA journal_mode=WAL`)
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("启用 WAL 模式失败：%v", err)
-	}
-
-	// 设置同步模式为 NORMAL，平衡性能和耐久性
-	_, err = db.Exec(`PRAGMA synchronous=NORMAL`)
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("设置 synchronous 失败：%v", err)
-	}
-
-	// 创建 files 表，path 为主键（自动创建唯一索引）
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS files (
-        path TEXT PRIMARY KEY,
-        timestamp INTEGER
-    )`)
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("创建表失败：%v", err)
-	}
-
-	return db, nil
-}
-
-// handleRefreshLocal 刷新本地文件数据库
+// handleRefreshLocal 刷新本地文件数据并更新文件数量
 func handleRefreshLocal(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "只支持POST请求", http.StatusMethodNotAllowed)
@@ -719,224 +710,128 @@ func handleRefreshLocal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mediaDir := flag.Lookup("media").Value.String()
-	if mediaDir == "" {
-		addLog("error", "未提供 --media 参数")
-		http.Error(w, "未配置媒体目录", http.StatusInternalServerError)
-		return
-	}
-
-	localDBPath := "local_files.db"
-
-	// 重新扫描本地文件并插入数据库
-	if err := scanLocalFiles(mediaDir, localDBPath); err != nil {
-		addLog("error", fmt.Sprintf("刷新本地数据库失败：%v", err))
-		http.Error(w, "刷新本地数据库失败", http.StatusInternalServerError)
-		return
-	}
-
-	addLog("success", "本地文件数据库刷新完成")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-}
-
-// scanLocalFiles 扫描本地文件并生成数据库，跳过字幕文件和空文件夹
-func scanLocalFiles(mediaDir, dbPath string) error {
-	// 定义需要跳过的字幕文件扩展名
-	skipExtensions := map[string]struct{}{
-		".srt": {}, ".ass": {}, ".vtt": {}, ".sub": {},
-	}
-
-	// 检查数据库是否存在
-	_, statErr := os.Stat(dbPath)
-	isNewDB := os.IsNotExist(statErr)
-	if statErr != nil && !isNewDB {
-		return fmt.Errorf("检查数据库 %s 失败：%v", dbPath, statErr)
-	}
-
-	// 根据场景记录日志
-	logMsg := "首次运行，初始化本地数据库"
-	if !isNewDB {
-		logMsg = "本地数据库已存在，重新扫描文件"
-	}
-
-	// 初始化或使用全局 localDB
-	dbMu.Lock()
-	if localDB == nil {
-		var err error
-		localDB, err = initLocalDB(dbPath)
-		if err != nil {
-			dbMu.Unlock()
-			return err
-		}
-	}
-	dbMu.Unlock()
-
-	// 获取要扫描的目录
 	configMu.RLock()
 	paths := config.SPathsAll
 	configMu.RUnlock()
 
-	var totalFiles int
+	// 使用新的内存Map方式扫描
+	localMap, err := scanLocalFilesToMap(mediaDir, paths)
+	if err != nil {
+		addLog("error", fmt.Sprintf("刷新本地文件映射失败：%v", err))
+		http.Error(w, "刷新本地文件映射失败", http.StatusInternalServerError)
+		return
+	}
+
+	// 更新配置中的路径计数
+	configMu.Lock()
+	if config.LocalPathCounts == nil {
+		config.LocalPathCounts = make(map[string]int)
+	}
+
+	for path, count := range localMap.Counts {
+		config.LocalPathCounts[path] = count
+	}
+
+	// 清理不存在的路径
+	for path := range config.LocalPathCounts {
+		found := false
+		for _, p := range paths {
+			if p == path {
+				found = true
+				break
+			}
+		}
+		if !found {
+			delete(config.LocalPathCounts, path)
+		}
+	}
+
+	if err := saveConfig(); err != nil {
+		configMu.Unlock()
+		addLog("error", fmt.Sprintf("保存配置文件失败：%v", err))
+		http.Error(w, "保存配置文件失败", http.StatusInternalServerError)
+		return
+	}
+	configMu.Unlock()
+
+	addLog("success", "本地文件数量刷新完成")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// scanLocalFilesToMap 扫描本地文件并生成文件信息Map
+func scanLocalFilesToMap(mediaDir string, paths []string) (*LocalFileInfo, error) {
+	startTime := time.Now()
+	addLog("info", fmt.Sprintf("开始扫描 %d 个路径", len(paths)))
+
+	result := &LocalFileInfo{
+		Files:  make(FileInfoMap),
+		Counts: make(map[string]int),
+	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	// 统计所有目录的总文件数，跳过字幕文件
+	// 并发扫描每个路径
 	for _, path := range paths {
 		wg.Add(1)
 		go func(p string) {
 			defer wg.Done()
+
 			dirPath := filepath.Join(mediaDir, p)
+			count := 0
+
 			err := filepath.Walk(dirPath, func(filePath string, info os.FileInfo, err error) error {
-				if err != nil {
+				if err != nil || info.IsDir() {
 					return err
 				}
-				if !info.IsDir() {
-					// 检查是否为字幕文件
-					ext := strings.ToLower(filepath.Ext(filePath))
-					if _, skip := skipExtensions[ext]; skip {
-						return nil // 跳过字幕文件
-					}
-					mu.Lock()
-					totalFiles++
-					mu.Unlock()
-				}
+
+				relativePath, _ := filepath.Rel(mediaDir, filePath)
+				relativePath = filepath.ToSlash(relativePath)
+
+				mu.Lock()
+				result.Files[relativePath] = info.ModTime().Unix()
+				count++
+				mu.Unlock()
+
 				return nil
 			})
-			if err != nil && !os.IsNotExist(err) {
-				addLog("warning", fmt.Sprintf("扫描目录 %s 失败：%v", p, err))
+
+			if err == nil {
+				mu.Lock()
+				result.Counts[p] = count
+				mu.Unlock()
 			}
 		}(path)
 	}
+
 	wg.Wait()
 
-	if totalFiles == 0 {
-		addLog("info", "数据库生成完成")
-		return nil
-	}
-
-	startTime := time.Now()
-	processedFiles := 0
-	var processedMu sync.Mutex
-	lastProgress := -10
-
-	tx, err := localDB.Beginx()
-	if err != nil {
-		return fmt.Errorf("启动事务失败：%v", err)
-	}
-
-	// 清空现有记录（如果是刷新场景）
-	if !isNewDB {
-		_, err = tx.Exec(`DELETE FROM files`)
-		if err != nil {
-			tx.Rollback()
-			return fmt.Errorf("清空数据库表失败：%v", err)
+	// 清理无效路径计数
+	for path := range result.Counts {
+		if !contains(paths, path) {
+			delete(result.Counts, path)
 		}
-	}
-
-	// 扫描每个目录并插入数据库，跳过字幕文件
-	for _, path := range paths {
-		dirPath := filepath.Join(mediaDir, path)
-		err := filepath.Walk(dirPath, func(filePath string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			if info.IsDir() {
-				return nil // 跳过目录（包括空文件夹）
-			}
-			// 检查是否为字幕文件
-			ext := strings.ToLower(filepath.Ext(filePath))
-			if _, skip := skipExtensions[ext]; skip {
-				return nil // 跳过字幕文件
-			}
-			relativePath, err := filepath.Rel(mediaDir, filePath)
-			if err != nil {
-				return err
-			}
-			relativePath = filepath.ToSlash(relativePath)
-			timestamp := info.ModTime().Unix()
-
-			_, err = tx.Exec(`INSERT OR REPLACE INTO files (path, timestamp) VALUES (?, ?)`, relativePath, timestamp)
-			if err != nil {
-				return fmt.Errorf("插入文件记录失败：%v", err)
-			}
-
-			processedMu.Lock()
-			processedFiles++
-			progress := int(float64(processedFiles) / float64(totalFiles) * 100)
-			if progress >= lastProgress+10 {
-				addLog("info", fmt.Sprintf("本地数据库生成进度：%d%% (%d/%d 文件)", progress, processedFiles, totalFiles))
-				lastProgress = progress - (progress % 10)
-			}
-			processedMu.Unlock()
-			return nil
-		})
-		if err != nil && !os.IsNotExist(err) {
-			tx.Rollback()
-			return fmt.Errorf("扫描目录 %s 失败：%v", path, err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("提交事务失败：%v", err)
 	}
 
 	duration := time.Since(startTime)
-	logMsg = fmt.Sprintf("本地数据库 %s 生成完成，共 %d 个文件，耗时 %s", dbPath, processedFiles, formatDuration(duration))
-	addLog("success", logMsg)
-	return nil
+	addLog("success", fmt.Sprintf("本地扫描完成，共 %d 个文件，耗时 %s",
+		len(result.Files), formatDuration(duration)))
+	return result, nil
 }
 
-// compareAndPrepareSync 比较数据库并准备同步文件
-func compareAndPrepareSync(localDBPath, tempDBPath string, paths []string) ([]FileInfo, []string, error) {
-	addLog("info", "开始比较本地和临时数据库")
-	dbMu.Lock()
-	if localDB == nil {
-		var err error
-		localDB, err = initLocalDB(localDBPath)
-		if err != nil {
-			dbMu.Unlock()
-			return nil, nil, fmt.Errorf("初始化本地数据库失败：%v", err)
-		}
-	}
-	if tempDB == nil {
-		var err error
-		tempDB, err = initLocalDB(tempDBPath)
-		if err != nil {
-			dbMu.Unlock()
-			return nil, nil, fmt.Errorf("初始化临时数据库失败：%v", err)
-		}
-	}
-	dbMu.Unlock()
+// compareAndPrepareSync 对比内存Map和服务器Map，返回需要更新和删除的文件
+func compareAndPrepareSync(localMap, serverMap FileInfoMap, paths []string) ([]FileInfo, []string, error) {
+	addLog("info", "开始差异对比")
 
-	var localFiles []DBFileInfo
-	err := localDB.Select(&localFiles, `SELECT path, timestamp FROM files`)
-	if err != nil {
-		return nil, nil, fmt.Errorf("查询本地数据库失败：%v", err)
-	}
+	toUpdate := make([]FileInfo, 0)
+	toDelete := make([]string, 0)
+	pathNotice := make(map[string]bool)
 
-	var tempFiles []DBFileInfo
-	err = tempDB.Select(&tempFiles, `SELECT path, timestamp FROM files`)
-	if err != nil {
-		return nil, nil, fmt.Errorf("查询临时数据库失败：%v", err)
-	}
-
-	localMap := make(map[string]int64)
-	for _, f := range localFiles {
-		localMap[f.Path] = f.Timestamp
-	}
-
-	tempMap := make(map[string]int64)
-	for _, f := range tempFiles {
-		tempMap[f.Path] = f.Timestamp
-	}
-
-	var toUpdate []FileInfo
-	var toDelete []string
-
-	for path, tempTimestamp := range tempMap {
+	// 检查服务器文件更新
+	for path, serverTS := range serverMap {
 		shouldSync := false
-		for _, p := range paths {
-			if strings.HasPrefix(path, p) {
+		for _, prefix := range paths {
+			if strings.HasPrefix(path, prefix) {
 				shouldSync = true
 				break
 			}
@@ -944,16 +839,18 @@ func compareAndPrepareSync(localDBPath, tempDBPath string, paths []string) ([]Fi
 		if !shouldSync {
 			continue
 		}
-		localTimestamp, exists := localMap[path]
-		if !exists || time.Duration(tempTimestamp-localTimestamp)*time.Second > 10*time.Minute {
-			toUpdate = append(toUpdate, FileInfo{Path: path, Timestamp: tempTimestamp})
+
+		localTS, exists := localMap[path]
+		if !exists || serverTS-localTS > 600 { // 服务器比本地超过 10 分钟
+			toUpdate = append(toUpdate, FileInfo{Path: path, Timestamp: serverTS})
 		}
 	}
 
+	// 检查需要删除的文件
 	for path := range localMap {
 		shouldDelete := false
-		for _, p := range paths {
-			if strings.HasPrefix(path, p) {
+		for _, prefix := range paths {
+			if strings.HasPrefix(path, prefix) {
 				shouldDelete = true
 				break
 			}
@@ -961,29 +858,35 @@ func compareAndPrepareSync(localDBPath, tempDBPath string, paths []string) ([]Fi
 		if !shouldDelete {
 			continue
 		}
-		if _, exists := tempMap[path]; !exists {
+
+		if _, exists := serverMap[path]; !exists {
 			toDelete = append(toDelete, path)
 		}
 	}
 
-	// 不再删除 temp_files.db 中本地已存在的记录，保持全量数据
-	// 更新 PathUpdateNotices
-	configMu.Lock()
-	if config.PathUpdateNotices == nil {
-		config.PathUpdateNotices = make(map[string]bool)
-	}
+	// 更新路径变更通知
 	for _, file := range toUpdate {
-		rootDir := strings.SplitN(file.Path, "/", 2)[0]
-		for _, p := range config.SPathsAll {
-			if p == rootDir && !contains(paths, p) {
-				config.PathUpdateNotices[p] = true
-			}
+		rootDir := getRootDir(file.Path)
+		if rootDir != "" && !contains(paths, rootDir) {
+			pathNotice[rootDir] = true
 		}
+	}
+
+	// 原子更新配置
+	configMu.Lock()
+	for k := range config.PathUpdateNotices {
+		if !pathNotice[k] {
+			delete(config.PathUpdateNotices, k)
+		}
+	}
+	for k, v := range pathNotice {
+		config.PathUpdateNotices[k] = v
 	}
 	saveConfig()
 	configMu.Unlock()
 
-	addLog("info", fmt.Sprintf("数据库比较完成，需更新 %d 个文件，需删除 %d 个文件，temp_files.db 保持全量数据", len(toUpdate), len(toDelete)))
+	addLog("info", fmt.Sprintf("内存对比完成：需更新 %d 个文件，需删除 %d 个文件",
+		len(toUpdate), len(toDelete)))
 	return toUpdate, toDelete, nil
 }
 
@@ -993,6 +896,8 @@ func downloadFile(ctx context.Context, file FileInfo, servers []ServerInfo, medi
 	if err := os.MkdirAll(filepath.Dir(localPath), 0777); err != nil {
 		return fmt.Errorf("创建目录失败：%v", err)
 	}
+
+	var attemptErrors []string
 	for i, server := range servers {
 		select {
 		case <-ctx.Done():
@@ -1002,55 +907,61 @@ func downloadFile(ctx context.Context, file FileInfo, servers []ServerInfo, medi
 			url := server.URL + "/" + encodedUrlPath
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 			if err != nil {
-				addLog("warning", fmt.Sprintf("创建请求 %s 失败：%v", file.Path, err))
+				attemptErrors = append(attemptErrors, fmt.Sprintf("服务器 %s 创建请求失败：%v", server.URL, err))
 				continue
 			}
 			resp, err := httpClient.Do(req)
 			if err != nil {
-				addLog("warning", fmt.Sprintf("从服务器 %s 下载 %s 失败：%v", server.URL, file.Path, err))
+				attemptErrors = append(attemptErrors, fmt.Sprintf("服务器 %s 下载失败：%v", server.URL, err))
 				if i < len(servers)-1 {
-					addLog("info", fmt.Sprintf("尝试备用服务器 %s", servers[i+1].URL))
 					continue
 				}
-				return fmt.Errorf("所有服务器下载 %s 失败，最后错误：%v", file.Path, err) // 修改：添加最后错误
+				return fmt.Errorf("所有服务器下载 %s 失败：%s", file.Path, strings.Join(attemptErrors, "; "))
 			}
 			defer resp.Body.Close()
-			if resp.StatusCode == 200 {
-				out, err := os.Create(localPath + ".tmp")
-				if err != nil {
-					return fmt.Errorf("创建文件 %s 失败：%v", localPath, err)
+
+			if resp.StatusCode == http.StatusNotFound { // 404
+				attemptErrors = append(attemptErrors, fmt.Sprintf("服务器 %s 返回 404", server.URL))
+				// 提前退出，无需尝试其他服务器
+				return fmt.Errorf("文件 %s 在服务器上不存在：%s", file.Path, strings.Join(attemptErrors, "; "))
+			} else if resp.StatusCode != http.StatusOK {
+				attemptErrors = append(attemptErrors, fmt.Sprintf("服务器 %s 返回状态码 %d", server.URL, resp.StatusCode))
+				if i < len(servers)-1 {
+					continue
 				}
-				written, err := io.Copy(out, resp.Body)
-				out.Close()
-				if err != nil {
-					os.Remove(localPath + ".tmp")
-					return fmt.Errorf("写入文件 %s 失败：%v", localPath, err)
-				}
-				if written == 0 {
-					os.Remove(localPath + ".tmp")
-					return fmt.Errorf("下载 %s 内容为空", file.Path)
-				}
-				if err := os.Rename(localPath+".tmp", localPath); err != nil {
-					os.Remove(localPath + ".tmp")
-					return fmt.Errorf("重命名文件 %s 失败：%v", localPath, err)
-				}
-				modTime := time.Unix(file.Timestamp, 0)
-				if err := os.Chtimes(localPath, modTime, modTime); err != nil {
-					addLog("error", fmt.Sprintf("设置文件 %s 的时间戳失败：%v", localPath, err))
-					os.Remove(localPath)
-					return err
-				}
-				if i == 0 {
-					addLog("success", fmt.Sprintf("下载完成：%s", file.Path))
-				} else {
-					addLog("success", fmt.Sprintf("下载完成：%s，使用服务器：%s", file.Path, server.URL))
-				}
-				return nil
+				return fmt.Errorf("所有服务器下载 %s 失败：%s", file.Path, strings.Join(attemptErrors, "; "))
 			}
-			addLog("warning", fmt.Sprintf("服务器 %s 返回状态码 %d", server.URL, resp.StatusCode))
+
+			// 下载成功
+			out, err := os.Create(localPath + ".tmp")
+			if err != nil {
+				return fmt.Errorf("创建文件 %s 失败：%v", localPath, err)
+			}
+			_, err = io.Copy(out, resp.Body)
+			out.Close()
+			if err != nil {
+				os.Remove(localPath + ".tmp")
+				return fmt.Errorf("写入文件 %s 失败：%v", localPath, err)
+			}
+			if err := os.Rename(localPath+".tmp", localPath); err != nil {
+				os.Remove(localPath + ".tmp")
+				return fmt.Errorf("重命名文件 %s 失败：%v", localPath, err)
+			}
+			modTime := time.Unix(file.Timestamp, 0)
+			if err := os.Chtimes(localPath, modTime, modTime); err != nil {
+				addLog("error", fmt.Sprintf("设置文件 %s 的时间戳失败：%v", localPath, err))
+				os.Remove(localPath)
+				return err
+			}
+			if i == 0 {
+				addLog("success", fmt.Sprintf("下载完成：%s", file.Path))
+			} else {
+				addLog("success", fmt.Sprintf("下载完成：%s，使用服务器：%s", file.Path, server.URL))
+			}
+			return nil
 		}
 	}
-	return fmt.Errorf("所有服务器下载 %s 失败", file.Path)
+	return fmt.Errorf("所有服务器下载 %s 失败：%s", file.Path, strings.Join(attemptErrors, "; "))
 }
 
 // deleteLocalFile 删除本地文件，移动到回收站
@@ -1059,22 +970,19 @@ func deleteLocalFile(mediaDir, path string) error {
 	recycleDir := filepath.Join(mediaDir, "recycle_bin")
 	recyclePath := filepath.Join(recycleDir, path)
 
-	// 验证文件存在性
 	if _, err := os.Stat(localPath); os.IsNotExist(err) {
-		addLog("warning", fmt.Sprintf("文件 %s 不存在，跳过移动到回收站（原因：在 temp_files.db 中不存在）", path))
-		return fmt.Errorf("文件 %s 不存在", path)
+		addLog("warning", fmt.Sprintf("文件 %s 不存在，跳过移动到回收站", path))
+		return nil
 	} else if err != nil {
-		addLog("error", fmt.Sprintf("检查文件 %s 失败：%v（原因：在 temp_files.db 中不存在）", path, err))
+		addLog("error", fmt.Sprintf("检查文件 %s 失败：%v", path, err))
 		return fmt.Errorf("检查文件 %s 失败：%v", path, err)
 	}
 
-	// 确保回收站目录存在
 	if err := os.MkdirAll(filepath.Dir(recyclePath), 0777); err != nil {
-		addLog("error", fmt.Sprintf("创建回收站目录 %s 失败：%v（原因：在 temp_files.db 中不存在）", filepath.Dir(recyclePath), err))
-		return fmt.Errorf("创建回收站目录 %s 失败：%v", filepath.Dir(recyclePath), err)
+		addLog("error", fmt.Sprintf("创建回收站目录 %s 失败：%v", filepath.Dir(recyclePath), err))
+		return fmt.Errorf("创建回收站目录失败：%v", err)
 	}
 
-	// 处理同名文件冲突
 	finalRecyclePath := recyclePath
 	if _, err := os.Stat(recyclePath); err == nil {
 		ext := filepath.Ext(path)
@@ -1084,13 +992,12 @@ func deleteLocalFile(mediaDir, path string) error {
 		finalRecyclePath = filepath.Join(filepath.Dir(recyclePath), newBase)
 	}
 
-	// 移动文件到回收站
 	if err := os.Rename(localPath, finalRecyclePath); err != nil {
-		addLog("error", fmt.Sprintf("移动文件 %s 到回收站 %s 失败：%v（原因：在 temp_files.db 中不存在）", path, finalRecyclePath, err))
-		return fmt.Errorf("移动文件 %s 到回收站 %s 失败：%v", path, finalRecyclePath, err)
+		addLog("error", fmt.Sprintf("移动文件 %s 到回收站 %s 失败：%v", path, finalRecyclePath, err))
+		return fmt.Errorf("移动文件失败：%v", err)
 	}
 
-	addLog("info", fmt.Sprintf("文件 %s 已移动到回收站 %s（原因：在 temp_files.db 中不存在）", path, finalRecyclePath))
+	addLog("info", fmt.Sprintf("文件 %s 已移动到回收站 %s", path, finalRecyclePath))
 	return nil
 }
 
@@ -1110,16 +1017,19 @@ func testMediaFolder(media string, paths []string) bool {
 
 // syncFiles 执行文件同步逻辑
 func syncFiles(media *string) {
-	if *media == "" {
-		addLog("error", "必须提供 --media 参数")
-		return
-	}
-
 	if err := loadConfig(); err != nil {
 		addLog("error", fmt.Sprintf("初始加载配置文件失败：%v", err))
 		return
 	}
-
+	intervalChange := make(chan int, 1)
+	restartTicker := func(ticker *time.Ticker, interval int) *time.Ticker {
+		if ticker != nil {
+			ticker.Stop()
+		}
+		newTicker := time.NewTicker(time.Duration(interval) * time.Hour)
+		addLog("info", fmt.Sprintf("新的同步间隔：%d 小时", interval))
+		return newTicker
+	}
 	configMu.RLock()
 	interval := config.Interval
 	configMu.RUnlock()
@@ -1135,38 +1045,12 @@ func syncFiles(media *string) {
 	}
 	ticker := time.NewTicker(time.Duration(interval) * time.Hour)
 	defer ticker.Stop()
-
-	localDBPath := "local_files.db"
-	tempDBPath := "temp_files.db"
-	scanListGzPath := filepath.Join(*media, ".scan.list.gz")
+	mediaDir := filepath.Clean(*media)
+	scanListGzPath := ".scan.list.gz"
 
 	for {
 		syncStateMu.Lock()
 		running := syncState.Running
-		fromPathSync := syncState.FromPathSync
-		if fromPathSync {
-			syncState.FromPathSync = false
-			syncStateMu.Unlock()
-			addLog("info", "从路径同步完成，进入主同步等待状态")
-			select {
-			case <-syncState.Trigger:
-				syncStateMu.Lock()
-				syncState.Running = true
-				syncState.LastStart = time.Now()
-				syncStateMu.Unlock()
-				addLog("info", "路径同步触发主同步，开始新一轮同步")
-			case <-syncState.SyncDone:
-				syncStateMu.Lock()
-				syncState.Running = false
-				syncStateMu.Unlock()
-				addLog("info", "主同步任务暂停，等待触发")
-				continue
-			case <-time.After(100 * time.Millisecond):
-				// 延迟处理定时器，避免干扰
-				continue
-			}
-			continue
-		}
 		syncStateMu.Unlock()
 
 		if !running {
@@ -1182,6 +1066,12 @@ func syncFiles(media *string) {
 				syncState.Running = false
 				syncStateMu.Unlock()
 				addLog("info", "主同步任务暂停，等待触发")
+				continue
+			case newInterval := <-intervalChange:
+				configMu.Lock()
+				config.Interval = newInterval
+				configMu.Unlock()
+				ticker = restartTicker(ticker, newInterval)
 				continue
 			case <-ticker.C:
 				syncStateMu.Lock()
@@ -1206,13 +1096,13 @@ func syncFiles(media *string) {
 		}
 		maxConcurrency := config.MaxConcurrency
 		configMu.RUnlock()
+
 		addLog("info", fmt.Sprintf("勾选同步路径：%v", paths))
-		mediaDir := filepath.Clean(*media)
 		if !testMediaFolder(mediaDir, paths) {
 			addLog("warning", fmt.Sprintf("%s 不包含所有目标文件夹，将创建缺失的目录", mediaDir))
 		}
 
-		// 清理残留的 .tmp 文件
+		// 清理 .tmp 文件
 		err := filepath.Walk(mediaDir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
@@ -1230,29 +1120,18 @@ func syncFiles(media *string) {
 			addLog("warning", fmt.Sprintf("清理临时文件失败：%v", err))
 		}
 
-		// 检查本地数据库
-		dbMu.Lock()
-		if localDB == nil {
-			var err error
-			localDB, err = initLocalDB(localDBPath)
-			if err != nil {
-				dbMu.Unlock()
-				addLog("error", fmt.Sprintf("初始化本地数据库失败：%v", err))
-				continue
-			}
-		}
-		dbMu.Unlock()
-
-		if _, err := os.Stat(localDBPath); os.IsNotExist(err) {
-			if err := scanLocalFiles(mediaDir, localDBPath); err != nil {
-				addLog("error", fmt.Sprintf("生成本地数据库失败：%v", err))
-				continue
-			}
+		// 扫描本地文件（内存Map版本）
+		localMap, err := scanLocalFilesToMap(mediaDir, paths)
+		if err != nil {
+			addLog("error", fmt.Sprintf("生成本地文件映射失败：%v", err))
+			continue
 		}
 
+		// 选择服务器
 		configMu.RLock()
 		servers := pickBestServers(config.SPool)
 		configMu.RUnlock()
+
 		if len(servers) == 0 {
 			addLog("error", "没有可用的服务器，等待 5 分钟后重试")
 			select {
@@ -1266,10 +1145,12 @@ func syncFiles(media *string) {
 				continue
 			}
 		}
+
 		url := servers[0].URL
 		addLog("info", fmt.Sprintf("使用服务器：%s", url))
 
-		isSame, _, err := checkAndUpdateScanList(url, scanListGzPath)
+		// 检查并下载 .scan.list.gz
+		isSame, serverTime, err := checkAndUpdateScanList(url, scanListGzPath)
 		if err != nil {
 			addLog("error", fmt.Sprintf("检查并更新数据包失败：%v", err))
 			continue
@@ -1280,9 +1161,11 @@ func syncFiles(media *string) {
 			nextRun := time.Now().Add(time.Duration(config.Interval) * time.Hour)
 			configMu.RUnlock()
 			addLog("info", fmt.Sprintf("服务器数据一致，等待下次检测，下次时间：%s", formatTime(nextRun)))
+
 			syncStateMu.Lock()
 			running := syncState.Running
 			syncStateMu.Unlock()
+
 			if running {
 				select {
 				case <-syncState.Trigger:
@@ -1302,33 +1185,28 @@ func syncFiles(media *string) {
 			continue
 		}
 
-		// 生成临时数据库
-		if err := generateTempDB(scanListGzPath, tempDBPath); err != nil {
-			addLog("error", fmt.Sprintf("生成临时数据库失败：%v", err))
+		// 生成服务器文件映射
+		serverMap, err := generateServerMap(scanListGzPath, paths)
+		if err != nil {
+			addLog("error", fmt.Sprintf("生成服务器文件映射失败：%v", err))
 			continue
 		}
 
-		// 删除 .scan.list.gz 文件
+		// 删除 .scan.list.gz
 		if err := os.Remove(scanListGzPath); err != nil && !os.IsNotExist(err) {
 			addLog("warning", fmt.Sprintf("删除数据包文件失败：%v", err))
 		}
 
-		// 比较数据库
-		toUpdate, toDelete, err := compareAndPrepareSync(localDBPath, tempDBPath, paths)
+		// 对比差异
+		toUpdate, toDelete, err := compareAndPrepareSync(localMap.Files, serverMap, paths)
 		if err != nil {
-			addLog("error", fmt.Sprintf("比较数据库失败：%v", err))
+			addLog("error", fmt.Sprintf("比较文件映射失败：%v", err))
 			continue
 		}
 
-		// 创建上下文以支持取消
 		ctx, cancel := context.WithCancel(context.Background())
-
-		// 监听停止信号
 		go func() {
 			select {
-			case <-syncState.StopPathSync:
-				addLog("info", "接收到停止信号，终止主同步")
-				cancel()
 			case <-syncState.SyncDone:
 				addLog("info", "主同步任务被停止")
 				cancel()
@@ -1336,94 +1214,142 @@ func syncFiles(media *string) {
 			}
 		}()
 
-		// 执行同步
+		// 执行核心同步
 		successFiles, failedFiles, err := syncFilesCore(ctx, mediaDir, servers, toUpdate, toDelete, maxConcurrency, true)
-
-		// 显式调用 cancel() 清理上下文
 		cancel()
 
-		if err != nil && err != context.Canceled {
-			addLog("error", fmt.Sprintf("核心同步失败：%v", err))
-			continue
-		}
+		// 更新本地路径计数
+		updateLocalPathCounts(localMap, paths)
 
-		// 如果任务被取消，跳过清理
-		if ctx.Err() != nil {
-			addLog("info", fmt.Sprintf("主同步被终止，耗时 %s", formatDuration(time.Since(startTime))))
-			continue
-		}
-
+		// 处理同步结果
 		syncStateMu.Lock()
-		if syncState.Running {
-			if len(failedFiles) > 0 {
-				addLog("warning", fmt.Sprintf("主同步完成，成功 %d 个文件，失败 %d 个文件，耗时 %s", len(successFiles), len(failedFiles), formatDuration(time.Since(startTime))))
-			} else {
-				addLog("success", fmt.Sprintf("主同步完成，成功 %d 个文件，耗时 %s", len(successFiles), formatDuration(time.Since(startTime))))
+		running = syncState.Running
+		syncStateMu.Unlock()
+
+		if err == context.Canceled {
+			addLog("info", fmt.Sprintf("主同步被手动终止，耗时 %s，未更新 scanListTime", formatDuration(time.Since(startTime))))
+			if running {
+				addLog("info", "同步被终止，但运行状态仍为 true，立即开始新一轮同步")
+				continue
 			}
+			syncStateMu.Lock()
+			syncState.Running = false
+			syncStateMu.Unlock()
+			addLog("info", "主同步任务暂停，等待触发")
+			continue
+		}
+
+		// 更新 scanListTime
+		configMu.Lock()
+		config.ScanListTime = serverTime
+		if err := saveConfig(); err != nil {
+			addLog("error", fmt.Sprintf("更新配置文件时间失败：%v", err))
+		}
+		configMu.Unlock()
+
+		addLog("info", fmt.Sprintf("本地数据日期 为 %s", formatTime(serverTime)))
+
+		if err != nil {
+			addLog("error", fmt.Sprintf("核心同步失败：%v", err))
+			select {
+			case <-time.After(5 * time.Minute):
+				continue
+			case <-syncState.SyncDone:
+				syncStateMu.Lock()
+				syncState.Running = false
+				syncStateMu.Unlock()
+				addLog("info", "主同步任务暂停，等待触发")
+				continue
+			}
+		}
+
+		if running {
+			if len(failedFiles) > 0 {
+				addLog("warning", fmt.Sprintf("主同步完成，成功 %d 个文件，失败 %d 个文件，耗时 %s",
+					len(successFiles), len(failedFiles), formatDuration(time.Since(startTime))))
+			} else {
+				addLog("success", fmt.Sprintf("主同步完成，成功 %d 个文件，耗时 %s",
+					len(successFiles), formatDuration(time.Since(startTime))))
+			}
+
 			configMu.RLock()
 			nextRun := time.Now().Add(time.Duration(config.Interval) * time.Hour)
 			configMu.RUnlock()
+
 			addLog("info", fmt.Sprintf("同步完成，进入等待状态，下次检测时间：%s", formatTime(nextRun)))
+
+			syncStateMu.Lock()
 			syncState.LastStart = time.Now()
+			syncStateMu.Unlock()
 		}
-		syncStateMu.Unlock()
+
+		// 等待下一轮同步
+		select {
+		case <-syncState.Trigger:
+			addLog("info", "手动触发同步，立即开始新一轮同步")
+			continue
+		case <-ticker.C:
+			addLog("info", "定时器触发，进入下一轮同步")
+			continue
+		case <-syncState.SyncDone:
+			syncStateMu.Lock()
+			syncState.Running = false
+			syncStateMu.Unlock()
+			addLog("info", "主同步任务暂停，等待触发")
+			continue
+		case <-time.After(time.Duration(interval) * time.Hour):
+			addLog("warning", "同步超时，强制进入下一次循环")
+			continue
+		}
+	}
+}
+
+// updateLocalPathCounts 使用内存Map更新本地路径计数
+func updateLocalPathCounts(localMap *LocalFileInfo, paths []string) {
+	configMu.Lock()
+	defer configMu.Unlock()
+
+	if config.LocalPathCounts == nil {
+		config.LocalPathCounts = make(map[string]int)
+	}
+
+	// 直接使用传入的 LocalFileInfo 结构体中的计数
+	for path, count := range localMap.Counts {
+		config.LocalPathCounts[path] = count
+	}
+
+	// 清理不再存在的路径
+	for path := range config.LocalPathCounts {
+		found := false
+		for _, p := range paths {
+			if p == path {
+				found = true
+				break
+			}
+		}
+		if !found {
+			delete(config.LocalPathCounts, path)
+		}
+	}
+
+	// 保存配置
+	if err := saveConfig(); err != nil {
+		addLog("error", fmt.Sprintf("保存路径计数失败：%v", err))
 	}
 }
 
 // syncFilesCore 执行文件同步核心逻辑
 func syncFilesCore(ctx context.Context, mediaDir string, servers []ServerInfo, toUpdate []FileInfo, toDelete []string, maxConcurrency int, deleteFiles bool) ([]FileInfo, []string, error) {
 	startTime := time.Now()
-	addLog("info", fmt.Sprintf("开始核心同步，待更新 %d 个文件，待删除 %d 个文件", len(toUpdate), len(toDelete)))
-
-	// 记录 toDelete 样本（如果数量较大）
-	if len(toDelete) > 100 {
-		sample := toDelete
-		if len(sample) > 5 {
-			sample = sample[:5]
-		}
-		addLog("info", fmt.Sprintf("toDelete 样本：%v", sample))
-	}
-
 	var wg sync.WaitGroup
 	semaphore := make(chan struct{}, maxConcurrency)
 	successFiles := make([]FileInfo, 0, len(toUpdate))
-	failedFiles := make([]string, 0, len(toUpdate))
+	failedFiles := make([]string, 0, len(toDelete)+len(toUpdate))
 	var successMu, failedMu sync.Mutex
-	deletedPaths := make([]string, 0, len(toDelete)) // 跟踪成功删除的路径
-	var deletedMu sync.Mutex
 
-	// 下载文件
-	for _, file := range toUpdate {
-		select {
-		case <-ctx.Done():
-			addLog("info", "核心同步文件下载被取消")
-			return successFiles, failedFiles, ctx.Err()
-		default:
-			wg.Add(1)
-			go func(f FileInfo) {
-				defer wg.Done()
-				semaphore <- struct{}{}
-				defer func() { <-semaphore }()
-				cleanedPath := filepath.Join(filepath.Dir(f.Path), cleanFileName(filepath.Base(f.Path)))
-				if err := downloadFile(ctx, f, servers, mediaDir, cleanedPath); err != nil {
-					failedMu.Lock()
-					failedFiles = append(failedFiles, f.Path)
-					failedMu.Unlock()
-					addLog("error", fmt.Sprintf("下载 %s 失败：%v", f.Path, err))
-				} else {
-					successMu.Lock()
-					successFiles = append(successFiles, f)
-					successMu.Unlock()
-				}
-			}(file)
-		}
-	}
-
-	// 等待下载完成
-	wg.Wait()
-
-	// 删除文件（如果启用）
-	if deleteFiles {
+	// 第一步：处理删除
+	if deleteFiles && len(toDelete) > 0 {
+		addLog("info", "开始处理本地多余文件的删除")
 		for _, path := range toDelete {
 			select {
 			case <-ctx.Done():
@@ -1435,83 +1361,74 @@ func syncFilesCore(ctx context.Context, mediaDir string, servers []ServerInfo, t
 					defer wg.Done()
 					semaphore <- struct{}{}
 					defer func() { <-semaphore }()
+
 					if err := deleteLocalFile(mediaDir, p); err != nil {
 						failedMu.Lock()
 						failedFiles = append(failedFiles, p)
 						failedMu.Unlock()
-					} else {
-						deletedMu.Lock()
-						deletedPaths = append(deletedPaths, p)
-						deletedMu.Unlock()
+						addLog("error", fmt.Sprintf("删除 %s 失败：%v", p, err))
 					}
 				}(path)
 			}
 		}
+		wg.Wait() // 等待删除完成
+		addLog("info", fmt.Sprintf("删除完成，成功 %d 个，失败 %d 个", len(toDelete)-len(failedFiles), len(failedFiles)))
 	}
 
-	// 等待删除完成
-	wg.Wait()
+	// 第二步：处理下载
+	if len(toUpdate) > 0 {
+		addLog("info", "开始处理文件下载和更新")
+		for _, file := range toUpdate {
+			select {
+			case <-ctx.Done():
+				addLog("info", "核心同步文件下载被取消")
+				return successFiles, failedFiles, ctx.Err()
+			default:
+				wg.Add(1)
+				go func(f FileInfo) {
+					defer wg.Done()
+					semaphore <- struct{}{}
+					defer func() { <-semaphore }()
 
-	// 如果任务被取消，跳过数据库更新
+					cleanedPath := filepath.Join(filepath.Dir(f.Path), cleanFileName(filepath.Base(f.Path)))
+					if err := downloadFile(ctx, f, servers, mediaDir, cleanedPath); err != nil {
+						failedMu.Lock()
+						failedFiles = append(failedFiles, f.Path)
+						failedMu.Unlock()
+						addLog("error", fmt.Sprintf("下载 %s 失败：%v", f.Path, err))
+					} else {
+						successMu.Lock()
+						successFiles = append(successFiles, f)
+						successMu.Unlock()
+					}
+				}(file)
+			}
+		}
+		wg.Wait() // 等待下载完成
+	}
+
+	// 如果任务被取消，跳过后续处理
 	if ctx.Err() != nil {
 		addLog("info", fmt.Sprintf("核心同步被终止，耗时 %s", formatDuration(time.Since(startTime))))
 		return successFiles, failedFiles, ctx.Err()
 	}
 
-	// 更新本地数据库
-	dbMu.Lock()
-	if localDB == nil {
-		dbMu.Unlock()
-		return nil, nil, fmt.Errorf("本地数据库未初始化")
-	}
-	db := localDB
-	dbMu.Unlock()
-
-	tx, err := db.Beginx()
-	if err != nil {
-		return nil, nil, fmt.Errorf("启动本地数据库事务失败：%v", err)
-	}
-
-	// 插入或更新成功文件
-	for _, file := range successFiles {
-		_, err := tx.Exec(`INSERT OR REPLACE INTO files (path, timestamp) VALUES (?, ?)`, file.Path, file.Timestamp)
-		if err != nil {
-			tx.Rollback()
-			return nil, nil, fmt.Errorf("批量更新数据库记录 %s 失败：%v", file.Path, err)
-		}
-	}
-
-	// 删除成功移动的文件记录
-	if deleteFiles {
-		for _, path := range deletedPaths {
-			_, err := tx.Exec(`DELETE FROM files WHERE path = ?`, path)
-			if err != nil {
-				tx.Rollback()
-				return nil, nil, fmt.Errorf("批量删除数据库记录 %s 失败：%v", path, err)
-			}
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, nil, fmt.Errorf("提交本地数据库事务失败：%v", err)
-	}
-
-	// 记录批量删除总结
-	totalDeletes := len(toDelete)
-	successDeletes := len(deletedPaths)
-	failedDeletes := totalDeletes - successDeletes
-	if totalDeletes > 0 {
-		addLog("info", fmt.Sprintf("批量删除完成：共 %d 个文件，成功 %d 个，失败 %d 个", totalDeletes, successDeletes, failedDeletes))
-	}
-
-	// 不再更新 temp_files.db，保持全量数据
-	addLog("success", fmt.Sprintf("核心同步完成，更新 %d 个文件，删除 %d 个文件，耗时 %s", len(successFiles), len(deletedPaths), formatDuration(time.Since(startTime))))
+	addLog("success", fmt.Sprintf("核心同步完成，更新 %d 个文件，删除 %d 个文件，耗时 %s", len(successFiles), len(toDelete)-len(failedFiles), formatDuration(time.Since(startTime))))
 	return successFiles, failedFiles, nil
+}
+
+// getRootDir 获取文件路径的根目录
+func getRootDir(filePath string) string {
+	parts := strings.Split(strings.TrimPrefix(filePath, "/"), "/")
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[0] + "/"
 }
 
 // checkAndUpdateScanList 检查并下载 .scan.list.gz 文件
 func checkAndUpdateScanList(serverURL, localPath string) (bool, time.Time, error) {
-	addLog("info", fmt.Sprintf("检查服务器 %s 数据包时间", serverURL))
+	//addLog("info", fmt.Sprintf("检查服务器 %s 数据包时间", serverURL))
 	resp, err := httpClient.Get(serverURL + "/.scan.list.gz")
 	if err != nil {
 		return false, time.Time{}, fmt.Errorf("请求服务器数据包失败：%v", err)
@@ -1570,384 +1487,52 @@ func checkAndUpdateScanList(serverURL, localPath string) (bool, time.Time, error
 		addLog("error", fmt.Sprintf("设置 %s 的时间失败：%v", localPath, err))
 	}
 
-	configMu.Lock()
-	config.ScanListTime = serverTime
-	configMu.Unlock()
-	if err := saveConfig(); err != nil {
-		addLog("error", fmt.Sprintf("更新配置文件时间失败：%v", err))
-	}
-
 	addLog("info", "数据包文件已更新")
 	return false, serverTime, nil
 }
 
-// generateTempDB 从 .scan.list.gz 生成临时数据库
-func generateTempDB(gzPath, tempDBPath string) error {
-	addLog("info", fmt.Sprintf("开始生成临时数据库：%s（全量数据）", tempDBPath))
+// generateServerMap 解析.gz文件生成内存Map
+func generateServerMap(gzPath string, activePaths []string) (FileInfoMap, error) {
 	startTime := time.Now()
-
-	dbMu.Lock()
-	if tempDB == nil {
-		var err error
-		tempDB, err = initLocalDB(tempDBPath)
-		if err != nil {
-			dbMu.Unlock()
-			return fmt.Errorf("初始化临时数据库失败：%v", err)
-		}
-	}
-	dbMu.Unlock()
+	fileMap := make(FileInfoMap)
 
 	gzFile, err := os.Open(gzPath)
 	if err != nil {
-		return fmt.Errorf("打开数据包失败：%v", err)
+		return nil, err
 	}
 	defer gzFile.Close()
 
 	gz, err := gzip.NewReader(gzFile)
 	if err != nil {
-		return fmt.Errorf("创建 gzip 读取器失败：%v", err)
+		return nil, err
 	}
 	defer gz.Close()
 
 	scanner := bufio.NewScanner(gz)
 	pattern := regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2} /(.*)$`)
 
-	var totalLines int
-	pathCounts := make(map[string]int)
-	configMu.RLock()
-	sPathsAll := config.SPathsAll
-	configMu.RUnlock()
-
 	for scanner.Scan() {
 		line := scanner.Text()
 		match := pattern.FindStringSubmatch(line)
-		if match != nil {
-			filePath := match[1]
-			for _, root := range sPathsAll {
-				if strings.HasPrefix(filePath, root) {
-					pathCounts[root]++
-					break
-				}
-			}
-			totalLines++
+		if match == nil {
+			continue
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("扫描数据包失败：%v", err)
-	}
 
-	configMu.Lock()
-	if config.ServerPathCounts == nil {
-		config.ServerPathCounts = make(map[string]int)
-	}
-	for _, root := range sPathsAll {
-		config.ServerPathCounts[root] = pathCounts[root]
-	}
-	if err := saveConfig(); err != nil {
-		addLog("error", fmt.Sprintf("保存服务器路径统计失败：%v", err))
-	}
-	configMu.Unlock()
+		filePath := match[1]
+		timestampStr := strings.Fields(line)[0] + " " + strings.Fields(line)[1]
+		t, _ := time.Parse("2006-01-02 15:04", timestampStr)
 
-	gzFile.Seek(0, io.SeekStart)
-	gz, err = gzip.NewReader(gzFile)
-	if err != nil {
-		return fmt.Errorf("重新创建 gzip 读取器失败：%v", err)
-	}
-	defer gz.Close()
-	scanner = bufio.NewScanner(gz)
-
-	tx, err := tempDB.Beginx()
-	if err != nil {
-		return fmt.Errorf("启动事务失败：%v", err)
-	}
-
-	processedLines := 0
-	var processedMu sync.Mutex
-	lastProgress := -10
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		match := pattern.FindStringSubmatch(line)
-		if match != nil {
-			file := match[1]
-			parts := strings.Fields(line)
-			if len(parts) >= 2 {
-				timestampStr := parts[0] + " " + parts[1]
-				t, err := time.Parse("2006-01-02 15:04", timestampStr)
-				if err != nil {
-					continue
-				}
-				_, err = tx.Exec(`INSERT OR REPLACE INTO files (path, timestamp) VALUES (?, ?)`, file, t.Unix())
-				if err != nil {
-					tx.Rollback()
-					return fmt.Errorf("插入文件记录失败：%v", err)
-				}
+		// 路径过滤
+		for _, path := range activePaths {
+			if strings.HasPrefix(filePath, path) {
+				fileMap[filePath] = t.Unix()
+				break
 			}
 		}
-
-		processedMu.Lock()
-		processedLines++
-		progress := int(float64(processedLines) / float64(totalLines) * 100)
-		if progress >= lastProgress+10 {
-			addLog("info", fmt.Sprintf("临时数据库生成进度：%d%% (%d/%d 条记录)", progress, processedLines, totalLines))
-			lastProgress = progress - (progress % 10)
-		}
-		processedMu.Unlock()
 	}
-
-	if err := scanner.Err(); err != nil {
-		tx.Rollback()
-		return fmt.Errorf("扫描数据包失败：%v", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("提交事务失败：%v", err)
-	}
-
-	addLog("success", fmt.Sprintf("临时数据库生成完成（全量数据），共 %d 条记录，耗时 %s", processedLines, formatDuration(time.Since(startTime))))
-	return nil
-}
-
-// handleSyncPath 处理路径同步请求
-func handleSyncPath(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "只支持POST请求", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		Path string `json:"path"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		addLog("error", fmt.Sprintf("解析立即同步请求 JSON 失败：%v", err))
-		http.Error(w, "解析JSON数据失败", http.StatusBadRequest)
-		return
-	}
-	if req.Path == "" {
-		addLog("error", "立即同步请求路径为空")
-		http.Error(w, "路径不能为空", http.StatusBadRequest)
-		return
-	}
-
-	addLog("info", fmt.Sprintf("接收到立即同步请求，路径：%s", req.Path))
-
-	syncStateMu.Lock()
-	if syncState.SyncingPath != "" {
-		syncStateMu.Unlock()
-		addLog("warning", fmt.Sprintf("已有同步任务（路径：%s），返回 busy", syncState.SyncingPath))
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "busy"})
-		return
-	}
-	syncState.SyncingPath = req.Path
-	syncStateMu.Unlock()
-
-	// 跟踪主同步触发状态
-	mainSyncTriggered := false
-	defer func() {
-		syncStateMu.Lock()
-		syncState.SyncingPath = ""
-		// 仅当实际更新或同步被终止时触发主同步
-		if mainSyncTriggered {
-			syncState.FromPathSync = true
-			select {
-			case syncState.Trigger <- struct{}{}:
-				addLog("info", "触发主同步等待循环")
-			default:
-				addLog("warning", "触发信号队列已满，主同步可能已在处理")
-				mainSyncTriggered = false
-			}
-			configMu.RLock()
-			nextRun := time.Now().Add(time.Duration(config.Interval) * time.Hour)
-			configMu.RUnlock()
-			addLog("info", fmt.Sprintf("路径同步完成，下一轮主同步计划时间：%s", formatTime(nextRun)))
-		}
-		addLog("info", fmt.Sprintf("路径 %s 同步任务结束", req.Path))
-		syncStateMu.Unlock()
-	}()
-
-	mediaDir := flag.Lookup("media").Value.String()
-	if mediaDir == "" {
-		addLog("error", "未提供 --media 参数")
-		http.Error(w, "未配置媒体目录", http.StatusInternalServerError)
-		return
-	}
-
-	localDBPath := "local_files.db"
-	tempDBPath := "temp_files.db"
-
-	dbMu.Lock()
-	if localDB == nil {
-		var err error
-		localDB, err = initLocalDB(localDBPath)
-		if err != nil {
-			dbMu.Unlock()
-			addLog("error", fmt.Sprintf("初始化本地数据库失败：%v", err))
-			http.Error(w, "初始化数据库失败", http.StatusInternalServerError)
-			return
-		}
-	}
-	if tempDB == nil {
-		var err error
-		tempDB, err = initLocalDB(tempDBPath)
-		if err != nil {
-			dbMu.Unlock()
-			addLog("error", fmt.Sprintf("初始化临时数据库失败：%v", err))
-			http.Error(w, "初始化数据库失败", http.StatusInternalServerError)
-			return
-		}
-	}
-	dbMu.Unlock()
-
-	if _, err := os.Stat(tempDBPath); os.IsNotExist(err) {
-		addLog("error", "临时数据库不存在，请先运行主同步")
-		http.Error(w, "临时数据库不存在", http.StatusInternalServerError)
-		return
-	} else if err != nil {
-		addLog("error", fmt.Sprintf("检查临时数据库失败：%v", err))
-		http.Error(w, "检查临时数据库失败", http.StatusInternalServerError)
-		return
-	}
-
-	addLog("info", fmt.Sprintf("查询本地数据库 %s 和临时数据库 %s，路径：%s", localDBPath, tempDBPath, req.Path))
-
-	// 查询本地文件
-	var localFiles []DBFileInfo
-	err := localDB.Select(&localFiles, `SELECT path, timestamp FROM files WHERE path LIKE ?`, req.Path+"%")
-	if err != nil {
-		addLog("error", fmt.Sprintf("查询本地文件列表失败：%v", err))
-		http.Error(w, "查询本地文件列表失败", http.StatusInternalServerError)
-		return
-	}
-
-	// 查询服务器文件
-	var serverFiles []DBFileInfo
-	err = tempDB.Select(&serverFiles, `SELECT path, timestamp FROM files WHERE path LIKE ?`, req.Path+"%")
-	if err != nil {
-		addLog("error", fmt.Sprintf("查询服务器文件列表失败：%v", err))
-		http.Error(w, "查询服务器文件列表失败", http.StatusInternalServerError)
-		return
-	}
-
-	// 构建本地文件映射
-	localMap := make(map[string]int64)
-	for _, file := range localFiles {
-		localMap[file.Path] = file.Timestamp
-	}
-
-	// 构建服务器文件映射
-	serverMap := make(map[string]int64)
-	for _, file := range serverFiles {
-		serverMap[file.Path] = file.Timestamp
-	}
-
-	// 确定需要更新的文件
-	var toUpdate []FileInfo
-	for path, serverTimestamp := range serverMap {
-		localTimestamp, exists := localMap[path]
-		if !exists || time.Duration(serverTimestamp-localTimestamp)*time.Second > 10*time.Minute {
-			toUpdate = append(toUpdate, FileInfo{Path: path, Timestamp: serverTimestamp})
-		}
-	}
-
-	// 确定需要删除的文件
-	var toDelete []string
-	for path := range localMap {
-		if _, exists := serverMap[path]; !exists {
-			toDelete = append(toDelete, path)
-		}
-	}
-
-	if len(toUpdate) == 0 && len(toDelete) == 0 {
-		addLog("info", fmt.Sprintf("目录 %s 无待同步文件", req.Path))
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":            "ok",
-			"mainSyncTriggered": false,
-			"message":           fmt.Sprintf("目录 %s 无需同步，无需触发主同步", req.Path),
-		})
-		return
-	}
-
-	configMu.RLock()
-	servers := pickBestServers(config.SPool)
-	maxConcurrency := config.MaxConcurrency
-	configMu.RUnlock()
-	if len(servers) == 0 {
-		addLog("error", "没有可用的服务器")
-		http.Error(w, "没有可用的服务器", http.StatusInternalServerError)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	defer cancel()
-
-	go func() {
-		select {
-		case <-syncState.StopPathSync:
-			addLog("info", fmt.Sprintf("接收到停止信号，终止路径 %s 同步", req.Path))
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
-
-	startTime := time.Now()
-	addLog("info", fmt.Sprintf("开始同步目录 %s，待更新 %d 个文件，待删除 %d 个文件", req.Path, len(toUpdate), len(toDelete)))
-
-	successFiles, failedFiles, err := syncFilesCore(ctx, mediaDir, servers, toUpdate, toDelete, maxConcurrency, true)
-	if err != nil && err != context.Canceled {
-		addLog("error", fmt.Sprintf("路径 %s 同步失败：%v", req.Path, err))
-		http.Error(w, "同步失败", http.StatusInternalServerError)
-		return
-	}
-
-	configMu.Lock()
-	if config.PathUpdateNotices != nil && len(failedFiles) == 0 {
-		delete(config.PathUpdateNotices, req.Path)
-		if err := saveConfig(); err != nil {
-			addLog("error", fmt.Sprintf("保存配置失败：%v", err))
-		}
-	}
-	configMu.Unlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	mainSyncTriggered = true // 标记需要触发主同步
-	if ctx.Err() != nil {
-		addLog("info", fmt.Sprintf("目录 %s 同步被用户终止，耗时 %s", req.Path, formatDuration(time.Since(startTime))))
-		message := fmt.Sprintf("目录 %s 同步被终止，主同步%s触发", req.Path, map[bool]string{true: "已", false: "未"}[mainSyncTriggered])
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":            "stopped",
-			"mainSyncTriggered": mainSyncTriggered,
-			"message":           message,
-		})
-		return
-	}
-
-	duration := time.Since(startTime)
-	if len(failedFiles) > 0 {
-		addLog("warning", fmt.Sprintf("目录 %s 同步完成，成功 %d 个文件，失败 %d 个文件，耗时 %s", req.Path, len(successFiles), len(failedFiles), formatDuration(duration)))
-		message := fmt.Sprintf("目录 %s 同步完成，成功 %d 个文件，失败 %d 个文件，主同步%s触发", req.Path, len(successFiles), len(failedFiles), map[bool]string{true: "已", false: "未"}[mainSyncTriggered])
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":            "ok",
-			"mainSyncTriggered": mainSyncTriggered,
-			"message":           message,
-			"successCount":      len(successFiles),
-			"failedCount":       len(failedFiles),
-		})
-	} else {
-		addLog("success", fmt.Sprintf("目录 %s 同步完成，成功 %d 个文件，耗时 %s", req.Path, len(successFiles), formatDuration(duration)))
-		message := fmt.Sprintf("目录 %s 同步完成，成功 %d 个文件，主同步%s触发", req.Path, len(successFiles), map[bool]string{true: "已", false: "未"}[mainSyncTriggered])
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":            "ok",
-			"mainSyncTriggered": mainSyncTriggered,
-			"message":           message,
-			"successCount":      len(successFiles),
-			"failedCount":       0,
-		})
-	}
+	addLog("success", fmt.Sprintf("服务器数据生成完成，共 %d 条记录，耗时 %s",
+		len(fileMap), formatDuration(time.Since(startTime))))
+	return fileMap, nil
 }
 
 // formatDuration 格式化时间间隔，保留小数点后两位
@@ -2012,6 +1597,12 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		config.Interval = *newConfig.Interval
 		addLog("info", fmt.Sprintf("同步间隔更新为 %d 小时", config.Interval))
+		// 通知 syncFiles 重启 ticker
+		select {
+		case intervalChange <- *newConfig.Interval:
+		default:
+			addLog("warning", "intervalChange 通道已满，ticker 可能未更新")
+		}
 	}
 	if newConfig.DNSType != nil || newConfig.DNSServer != nil || newConfig.DNSEnabled != nil {
 		dnsEnabled := config.DNSEnabled
@@ -2126,32 +1717,27 @@ func handlePaths(w http.ResponseWriter, r *http.Request) {
 // handlePathsCount 返回本地路径的文件数量
 func handlePathsCount(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	//mediaDir := flag.Lookup("media").Value.String()
-	dbPath := "local_files.db" // 修改：修正为容器工作目录
-	dbMu.Lock()
-	if localDB == nil {
-		var err error
-		localDB, err = initLocalDB(dbPath)
-		if err != nil {
-			dbMu.Unlock()
-			http.Error(w, "初始化数据库失败", http.StatusInternalServerError)
-			return
-		}
-	}
-	db := localDB // 新增：复用全局 localDB
-	dbMu.Unlock()
 
+	configMu.RLock()
 	pathCounts := make(map[string]int)
 	for _, path := range config.SPathsAll {
-		var count int
-		err := db.Get(&count, `SELECT COUNT(*) FROM files WHERE path LIKE ?`, path+"%")
-		if err != nil {
-			pathCounts[path] = -1
+		count, exists := config.LocalPathCounts[path]
+		if !exists {
+			pathCounts[path] = -1 // 表示未知
 		} else {
 			pathCounts[path] = count
 		}
 	}
-	json.NewEncoder(w).Encode(pathCounts)
+	message := ""
+	if len(config.LocalPathCounts) == 0 {
+		message = "本地文件计数未生成，请触发刷新"
+	}
+	configMu.RUnlock()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"counts":  pathCounts,
+		"message": message,
+	})
 }
 
 // handleServerPathsCount 返回服务器路径的文件数量
@@ -2250,21 +1836,16 @@ func handleSync(w http.ResponseWriter, r *http.Request) {
 		nextRun = formatTime(syncState.LastStart.Add(time.Duration(config.Interval) * time.Hour))
 	}
 	message := "同步 " + map[bool]string{true: "运行中", false: "已停止"}[syncState.Running]
-	if syncState.SyncingPath != "" {
-		message = fmt.Sprintf("同步目录 %s", syncState.SyncingPath)
-	}
 	json.NewEncoder(w).Encode(struct {
-		IsRunning   bool   `json:"isRunning"`
-		SyncingPath string `json:"syncingPath"`
-		Message     string `json:"message"`
-		NextRun     string `json:"nextRun"`
-		Interval    int    `json:"interval"`
+		IsRunning bool   `json:"isRunning"`
+		Message   string `json:"message"`
+		NextRun   string `json:"nextRun"`
+		Interval  int    `json:"interval"`
 	}{
-		IsRunning:   syncState.Running,
-		SyncingPath: syncState.SyncingPath,
-		Message:     message,
-		NextRun:     nextRun,
-		Interval:    config.Interval,
+		IsRunning: syncState.Running,
+		Message:   message,
+		NextRun:   nextRun,
+		Interval:  config.Interval,
 	})
 }
 
@@ -2301,15 +1882,6 @@ func handleSyncStop(w http.ResponseWriter, r *http.Request) {
 		default:
 			addLog("warning", "停止信号队列已满") // 新增
 		}
-	}
-	if syncState.SyncingPath != "" {
-		select {
-		case syncState.StopPathSync <- struct{}{}:
-			addLog("info", fmt.Sprintf("手动停止路径同步：%s", syncState.SyncingPath)) // 修改：在锁内调用
-		default:
-			addLog("warning", "路径同步停止信号队列已满") // 新增
-		}
-		syncState.SyncingPath = ""
 	}
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -2408,17 +1980,206 @@ func validateMediaDir(mediaDir string) error {
 	return nil
 }
 
+// checkMediaPermissions 检查媒体目录的读、写、执行权限
+func checkMediaPermissions(mediaDir string) error {
+	// 检查读权限：尝试打开目录并读取内容
+	dir, err := os.Open(mediaDir)
+	if err != nil {
+		return fmt.Errorf("无读权限（无法打开目录）：%v", err)
+	}
+	_, err = dir.Readdirnames(1) // 尝试读取至少一个条目
+	dir.Close()
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("无读权限（无法读取目录内容）：%v", err)
+	}
+
+	// 检查执行权限：检查文件模式并尝试访问子目录
+	stat, err := os.Stat(mediaDir)
+	if err != nil {
+		return fmt.Errorf("无法获取目录权限信息：%v", err)
+	}
+	mode := stat.Mode()
+	if mode&0o100 == 0 { // 检查用户执行权限
+		return fmt.Errorf("无执行权限（目录不可遍历）")
+	}
+	// 验证子目录访问（每日更新由 validateMediaDir 保证存在）
+	dailyUpdatePath := filepath.Join(mediaDir, "每日更新")
+	if _, err := os.Stat(dailyUpdatePath); err != nil {
+		return fmt.Errorf("无执行权限（无法访问子目录）：%v", err)
+	}
+
+	// 检查写权限：尝试创建并删除临时文件
+	tempFile := filepath.Join(mediaDir, ".perm_test")
+	file, err := os.Create(tempFile)
+	if err != nil {
+		return fmt.Errorf("无写权限（无法创建文件）：%v", err)
+	}
+	file.Close()
+	if err := os.Remove(tempFile); err != nil {
+		return fmt.Errorf("无写权限（无法删除文件）：%v", err)
+	}
+
+	return nil
+}
+
+// handleRecycleBinCount 返回回收站文件数量
+func handleRecycleBinCount(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	mediaDir := flag.Lookup("media").Value.String()
+	recycleDir := filepath.Join(mediaDir, "recycle_bin")
+	var fileCount int
+	err := filepath.Walk(recycleDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			fileCount++
+		}
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		http.Error(w, "统计回收站文件失败", http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]int{"fileCount": fileCount})
+}
+
+// handleRecycleBinClear 清空回收站
+func handleRecycleBinClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "只支持POST请求", http.StatusMethodNotAllowed)
+		return
+	}
+
+	mediaDir := flag.Lookup("media").Value.String()
+	recycleDir := filepath.Join(mediaDir, "recycle_bin")
+
+	// 统计文件数量
+	var fileCount int
+	err := filepath.Walk(recycleDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			fileCount++
+		}
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		http.Error(w, "统计回收站文件失败", http.StatusInternalServerError)
+		return
+	}
+
+	// 直接删除整个 recycle_bin 文件夹
+	if err := os.RemoveAll(recycleDir); err != nil {
+		http.Error(w, "清空回收站失败", http.StatusInternalServerError)
+		return
+	}
+
+	// 重新创建空的 recycle_bin 文件夹
+	if err := os.MkdirAll(recycleDir, 0777); err != nil {
+		http.Error(w, "重建回收站目录失败", http.StatusInternalServerError)
+		return
+	}
+
+	addLog("success", fmt.Sprintf("回收站已清空，删除 %d 个文件", fileCount))
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "ok",
+		"message": fmt.Sprintf("已清空 %d 个文件", fileCount),
+	})
+}
+
+// handleRecycleBinList 返回回收站文件树列表
+func handleRecycleBinList(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	mediaDir := flag.Lookup("media").Value.String()
+	recycleDir := filepath.Join(mediaDir, "recycle_bin")
+
+	var filePaths []string
+	err := filepath.Walk(recycleDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			relativePath, err := filepath.Rel(mediaDir, path)
+			if err != nil {
+				return err
+			}
+			relativePath = filepath.ToSlash(relativePath)
+			filePaths = append(filePaths, relativePath)
+		}
+		return nil
+	})
+
+	if err != nil && !os.IsNotExist(err) {
+		addLog("error", fmt.Sprintf("遍历回收站目录失败：%v", err))
+		http.Error(w, "获取回收站文件列表失败", http.StatusInternalServerError)
+		return
+	}
+
+	// 如果回收站为空，返回提示
+	if len(filePaths) == 0 {
+		w.Write([]byte("回收站为空"))
+		return
+	}
+
+	// 按路径排序，确保输出有序
+	sort.Strings(filePaths)
+	// 拼接 TXT 内容，每行一个路径
+	output := strings.Join(filePaths, "\n")
+	w.Write([]byte(output))
+}
+
+// handleResetScanListTime 将 scanListTime 重置为固定时间以触发同步
+func handleResetScanListTime(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "只支持POST请求", http.StatusMethodNotAllowed)
+		return
+	}
+
+	configMu.Lock()
+	oldTime := config.ScanListTime
+	config.ScanListTime = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := saveConfig(); err != nil {
+		configMu.Unlock()
+		http.Error(w, "保存配置文件失败", http.StatusInternalServerError)
+		return
+	}
+	configMu.Unlock()
+
+	syncStateMu.Lock()
+	select {
+	case syncState.Trigger <- struct{}{}:
+		addLog("info", "重置数据包时间后触发主同步")
+	default:
+		addLog("warning", "触发信号队列已满，主同步可能已在处理")
+	}
+	syncStateMu.Unlock()
+
+	addLog("info", fmt.Sprintf("数据包日期 从 %s 重置为 %s", formatTime(oldTime), formatTime(config.ScanListTime)))
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "ok",
+		"message": "数据包时间已重置，已触发同步",
+	})
+}
 func main() {
-	// 初始化东八区时区
 	var err error
 	shanghaiLoc, err = time.LoadLocation("Asia/Shanghai")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "加载时区失败：%v\n", err)
 		os.Exit(1)
 	}
-
-	err = loadConfig()
-	if err != nil {
+	media := flag.String("media", "", "存储下载媒体文件的路径（必须）")
+	port := flag.Int("port", 8080, "HTTP 服务器端口（默认 8080）")
+	flag.Parse()
+	// 初始化日志缓冲区（使用默认大小，稍后根据配置调整）
+	logsMu.Lock()
+	logs = ring.New(50000) // 初始默认大小 50000
+	logsMu.Unlock()
+	// 加载配置文件
+	if err := loadConfig(); err != nil {
 		fmt.Fprintf(os.Stderr, "加载配置文件失败：%v\n", err)
 		os.Exit(1)
 	}
@@ -2441,7 +2202,7 @@ func main() {
 					config.SPool = servers
 					configMu.Unlock()
 					if err := saveConfig(); err != nil {
-						fmt.Fprintf(os.Stderr, "保存服务器列表到 配置文件 失败：%v\n", err)
+						fmt.Fprintf(os.Stderr, "保存服务器列表到配置文件失败：%v\n", err)
 					} else {
 						fmt.Fprintf(os.Stdout, "服务器列表更新成功，共 %d 个服务器\n", len(servers))
 					}
@@ -2471,7 +2232,6 @@ func main() {
 				if len(paths) > 0 {
 					configMu.Lock()
 					config.SPathsAll = paths
-					// 确保 ActivePaths 只包含 sPathsAll 中的路径
 					config.ActivePaths = intersectPaths(config.ActivePaths, paths)
 					configMu.Unlock()
 					if err := saveConfig(); err != nil {
@@ -2489,45 +2249,23 @@ func main() {
 	}
 
 	logsMu.Lock()
-	logs = ring.New(config.LogSize) // 修改：使用 config.LogSize
+	logs = ring.New(config.LogSize)
 	logsMu.Unlock()
 
-	media := flag.String("media", "", "存储下载媒体文件的路径（必须）")
-	port := flag.Int("port", 8080, "HTTP 服务器端口（默认 8080）")
-	flag.Parse()
-
-	// 验证端口有效性
 	if *port < 1 || *port > 65535 {
 		fmt.Fprintf(os.Stderr, "端口 %d 无效，必须在 1-65535 范围内\n", *port)
 		os.Exit(1)
 	}
-	// 检查 media 目录有效性
 	if err := validateMediaDir(*media); err != nil {
 		fmt.Fprintf(os.Stderr, "无效的媒体目录：%v\n", err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stdout, "媒体目录 %s 验证通过\n", *media)
-
-	// 初始化数据库连接
-	if *media != "" {
-		localDBPath := "local_files.db"
-		tempDBPath := "temp_files.db"
-		dbMu.Lock()
-		localDB, err = initLocalDB(localDBPath)
-		if err != nil {
-			dbMu.Unlock()
-			fmt.Fprintf(os.Stderr, "初始化本地数据库失败：%v\n", err)
-			os.Exit(1)
-		}
-		tempDB, err = initLocalDB(tempDBPath)
-		if err != nil {
-			localDB.Close()
-			dbMu.Unlock()
-			fmt.Fprintf(os.Stderr, "初始化临时数据库失败：%v\n", err)
-			os.Exit(1)
-		}
-		dbMu.Unlock()
+	fmt.Fprintf(os.Stdout, "媒体目录 %s 有效,", *media)
+	if err := checkMediaPermissions(*media); err != nil {
+		fmt.Fprintf(os.Stderr, " %s 权限不足：%v\n", *media, err)
+		os.Exit(1)
 	}
+	fmt.Fprintf(os.Stdout, "权限检查通过，具备读、写、执行权限\n")
 	initHttpClient()
 
 	addLog("info", "程序初始化完成，开始后台同步")
@@ -2544,9 +2282,12 @@ func main() {
 	http.HandleFunc("/api/sync", handleSync)
 	http.HandleFunc("/api/sync/start", handleSyncStart)
 	http.HandleFunc("/api/sync/stop", handleSyncStop)
-	http.HandleFunc("/api/sync/path", handleSyncPath)
 	http.HandleFunc("/api/config/get", handleConfigGet)
 	http.HandleFunc("/api/refresh-local", handleRefreshLocal)
+	http.HandleFunc("/api/recycle-bin/count", handleRecycleBinCount)
+	http.HandleFunc("/api/recycle-bin/clear", handleRecycleBinClear)
+	http.HandleFunc("/api/recycle-bin/list", handleRecycleBinList)
+	http.HandleFunc("/api/reset-scanlist-time", handleResetScanListTime)
 	http.Handle("/", fs)
 
 	addr := fmt.Sprintf(":%d", *port)
@@ -2555,17 +2296,6 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "服务器启动失败：%v\n", err)
 		addLog("error", fmt.Sprintf("服务器启动失败（端口 %d）：%v", *port, err))
-		// 关闭数据库连接
-		dbMu.Lock()
-		if localDB != nil {
-			localDB.Close()
-			localDB = nil
-		}
-		if tempDB != nil {
-			tempDB.Close()
-			tempDB = nil
-		}
-		dbMu.Unlock()
 		os.Exit(1)
 	}
 }

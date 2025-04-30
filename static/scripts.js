@@ -1,6 +1,5 @@
 let logRefreshTimer = null;
 let currentPage = 1;
-let currentSyncingPath = ''; // 记录当前同步路径
 
 function showStatus(message, isError = false) {
     const status = document.getElementById('status');
@@ -64,7 +63,7 @@ function debounce(fn, delay) {
         timeout = setTimeout(() => fn(...args), delay);
     };
 }
-
+const debouncedLoadPaths = debounce(loadPaths, 1000);
 async function refreshLogs() {
     const limit = parseInt(document.getElementById('logLimit').value);
     const filter = document.getElementById('logFilter').value;
@@ -209,18 +208,9 @@ async function getSyncStatus() {
         const localTimestamp = document.getElementById('localTimestamp');
         const startBtn = document.getElementById('startSyncBtn');
         const stopBtn = document.getElementById('stopSyncBtn');
-
-        currentSyncingPath = status.syncingPath; // 更新当前同步路径
-
-        if (status.syncingPath) {
-            runningStatus.textContent = '同步中';
-            runningStatus.className = 'sync-checking';
-            message.textContent = status.message;
-        } else {
-            runningStatus.textContent = status.isRunning ? '运行中' : '已停止';
-            runningStatus.className = status.isRunning ? 'sync-running' : 'sync-waiting';
-            message.textContent = status.message;
-        }
+        runningStatus.textContent = status.isRunning ? '运行中' : '已停止';
+        runningStatus.className = status.isRunning ? 'sync-running' : 'sync-waiting';
+        message.textContent = status.message;
         nextRun.textContent = status.nextRun || '-';
         intervalDisplay.textContent = status.interval ? `${status.interval} 小时` : '-';
         if (!intervalInput.dataset.initialized) {
@@ -251,10 +241,6 @@ async function startSync() {
 async function stopSync() {
     try {
         const response = await fetchAPI('/api/sync/stop', { method: 'POST' });
-        if (response.status === 'ok') {
-            showStatus(currentSyncingPath ? `路径 ${currentSyncingPath} 同步已停止` : '主同步已停止');
-        }
-        currentSyncingPath = ''; // 清空同步路径
         getSyncStatus();
         await loadPaths(); // 刷新按钮状态
         if (document.querySelector('.tab-button[data-tab="logs"]').classList.contains('active')) {
@@ -264,60 +250,22 @@ async function stopSync() {
         showStatus(`停止失败: ${error.message}`, true);
     }
 }
-
-async function syncPath(path) {
-    const btn = document.querySelector(`.sync-path-btn[data-path="${path}"]`);
-    btn.disabled = true;
-    console.log(`触发立即同步：${path}`);
-    try {
-        // 调用停止同步功能
-        console.log("请求停止主同步");
-        await stopSync(); // 复用 stopSync 逻辑
-        console.log("停止同步响应成功");
-
-        // 触发路径同步
-        console.log(`开始路径同步：${path}`);
-        document.querySelectorAll('.sync-path-btn').forEach(b => b.disabled = true);
-        const response = await fetchAPI('/api/sync/path', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path })
-        });
-
-        if (response.status === 'busy') {
-            showStatus('当前已有同步任务运行，请稍后再试', true);
-            console.log("同步任务忙碌，返回 busy");
-        } else if (response.status === 'stopped') {
-            showStatus(`目录 ${path} 同步被终止`);
-            console.log(`路径 ${path} 同步被终止`);
-        } else {
-            showStatus(`目录 ${path} 同步完成`);
-            console.log(`路径 ${path} 同步完成`);
-            await loadPaths(); // 刷新路径列表
-        }
-    } catch (error) {
-        showStatus(`同步失败: ${error.message}`, true);
-        console.error(`同步失败: ${error.message}`);
-    } finally {
-        currentSyncingPath = ''; // 清空同步路径
-        btn.disabled = false;
-        await getSyncStatus(); // 刷新按钮状态
-        await loadPaths(); // 确保 diff 更新
-        console.log("同步请求结束，恢复按钮状态");
-    }
-}
-
 async function loadPaths() {
     try {
         const { allPaths, activePaths, pathUpdateNotices } = await fetchAPI('/api/paths');
-        const pathCounts = await fetchAPI('/api/paths/count');
+        const pathCountsResponse = await fetchAPI('/api/paths/count');
+        const pathCounts = pathCountsResponse.counts;
+        const pathCountsMessage = pathCountsResponse.message;
         const serverCounts = await fetchAPI('/api/server-paths-count');
         const pathList = document.getElementById('pathList');
         pathList.innerHTML = allPaths.length ? '' : '<div class="checkbox-group">暂无目录</div>';
+        if (pathCountsMessage) {
+            pathList.innerHTML += `<div class="path-count-message">${pathCountsMessage}</div>`;
+        }
         allPaths.forEach(path => {
-            const localCount = pathCounts[path] >= 0 ? pathCounts[path] : '未知';
+            const localCount = pathCounts[path] >= 0 ? pathCounts[path] : '正在加载...';
             const serverCount = serverCounts[path] >= 0 ? serverCounts[path] : '未知';
-            const diff = localCount !== '未知' && serverCount !== '未知' ? localCount - serverCount : null;
+            const diff = localCount !== '正在加载...' && serverCount !== '未知' ? localCount - serverCount : null;
             let diffText = '';
             let diffClass = '';
             if (diff !== null) {
@@ -333,18 +281,17 @@ async function loadPaths() {
                 }
             }
             const hasUpdate = pathUpdateNotices && pathUpdateNotices[path] ? '<span class="update-notice">有可更新数据!</span>' : '';
-            const isSyncing = currentSyncingPath === path;
 
             pathList.innerHTML += `
                 <div class="checkbox-group">
                     <input type="checkbox" id="path_${path}" ${activePaths.includes(path) ? 'checked' : ''}>
                     <label for="path_${path}">${path}</label>
                     <span class="file-count ${diffClass}" data-diff="${diff !== null ? diff : '未知'}">(本地: ${localCount}, 服务器: ${serverCount}) ${diffText}</span>
-                    <button class="sync-path-btn" data-path="${path}" onclick="syncPath('${path}')" ${isSyncing || diff === 0 ? 'disabled' : ''}>立即同步</button>
                     ${hasUpdate}
                 </div>`;
         });
     } catch (error) {
+        await loadRecycleBinCount();
         showStatus(`加载路径失败: ${error.message}`, true);
     }
 }
@@ -608,10 +555,72 @@ async function saveConcurrencyConfig() {
         showStatus(`保存失败: ${error.message}`, true);
     }
 }
+//加载回收站数量
+async function loadRecycleBinCount() {
+    try {
+        const data = await fetchAPI('/api/recycle-bin/count');
+        document.getElementById('recycleBinCount').textContent = data.fileCount;
+    } catch (error) {
+        document.getElementById('recycleBinCount').textContent = '未知';
+        showStatus(`加载回收站文件数量失败: ${error.message}`, true);
+    }
+}
+async function resetScanListTime() {
+    try {
+        const response = await fetchAPI('/api/reset-scanlist-time', { method: 'POST' });
+        showStatus(response.message);
+        getSyncStatus(); // 刷新同步状态，更新 localTimestamp
+        if (document.querySelector('.tab-button[data-tab="logs"]').classList.contains('active')) {
+            setTimeout(debouncedRefreshLogs, 1000);
+        }
+    } catch (error) {
+        showStatus(`重置数据包时间失败: ${error.message}`, true);
+    }
+}
+async function exportRecycleBinList() {
+    try {
+        const response = await fetch('/api/recycle-bin/list');
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const text = await response.text();
+        if (text === "回收站为空") {
+            showStatus('回收站为空，无文件可导出');
+            return;
+        }
+        const blob = new Blob([text], { type: 'text/plain; charset=utf-8' });
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `recycle_bin_tree_${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+        a.click();
+        window.URL.revokeObjectURL(url);
+        showStatus('回收站文件列表导出成功');
+    } catch (error) {
+        showStatus(`导出失败: ${error.message}`, true);
+    }
+}
+async function clearRecycleBin() {
+    try {
+        const data = await fetchAPI('/api/recycle-bin/count');
+        const fileCount = data.fileCount;
+        if (fileCount === 0) {
+            showStatus('回收站为空，无需清空');
+            return;
+        }
+        if (!confirm(`此次清空文件数量为 ${fileCount}，是否确定清除？`)) {
+            return;
+        }
+        const response = await fetchAPI('/api/recycle-bin/clear', { method: 'POST' });
+        showStatus(response.message);
+        await loadRecycleBinCount();
+    } catch (error) {
+        showStatus(`清空回收站失败: ${error.message}`, true);
+    }
+}
 
 window.onload = () => {
     initTheme(); // 初始化主题
     getSyncStatus();
     loadPaths();
+    loadRecycleBinCount();
     setInterval(getSyncStatus, 5000);
 };

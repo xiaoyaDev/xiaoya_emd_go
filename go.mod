@@ -3,8 +3,6 @@ module github.com/xiaoyaDev/xiaoya_emd_go
 go 1.24
 
 require (
-	github.com/jmoiron/sqlx v1.4.0
-	github.com/mattn/go-sqlite3 v1.14.28
 	github.com/miekg/dns v1.1.65
 	golang.org/x/time v0.11.0
 )

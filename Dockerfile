@@ -10,7 +10,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o xiaoya_emd main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o xiaoya_emd main.go
 
 FROM alpine:3.21
 

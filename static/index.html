@@ -9,7 +9,7 @@
 </head>
 <body>
     <div class="container">
-        <h1>小雅爬虫管理 V1.2</h1>
+        <h1>小雅爬虫管理 V1.5</h1>
         <div class="top-controls">
             <button class="theme-toggle" onclick="toggleTheme()">切换主题</button>
         </div>
@@ -35,9 +35,10 @@
                     <div class="sync-controls">
                         <button id="startSyncBtn" class="primary" onclick="startSync()"><i class="fas fa-play"></i> 开始同步</button>
                         <button id="stopSyncBtn" class="danger" onclick="stopSync()"><i class="fas fa-stop"></i> 停止同步</button>
+                        <button id="resetTimeBtn" class="primary" onclick="resetScanListTime()"><i class="fas fa-undo"></i> 重置时间并同步</button>
                         <div class="sync-interval">
                             <input type="number" id="syncInterval" min="1" max="24" step="1" placeholder="小时">
-                            <button class="primary" onclick="saveInterval()"><i class="fas fa-save"></i> 保存</button>
+                            <button class="primary" onclick="saveInterval()"><i class="fas fa-save"></i> 同步间隔</button>
                         </div>
                     </div>
                 </div>
@@ -49,6 +50,16 @@
                 <button class="primary" onclick="savePaths()"><i class="fas fa-save"></i> 保存目录设置</button>
                 <button class="primary" onclick="refreshLocalData()"><i class="fas fa-sync"></i> 刷新本地数据</button>
             </div>
+            
+            <div class="section">
+                <div class="section-title">回收站管理</div>
+                <div class="recycle-bin-status">
+                    <div><strong>回收站文件数量：</strong><span id="recycleBinCount">加载中...</span></div>
+                    <button class="primary" onclick="exportRecycleBinList()"><i class="fas fa-download"></i> 导出文件列表</button>
+                    <button class="danger" onclick="clearRecycleBin()"><i class="fas fa-trash"></i> 清空回收站</button>
+                </div>
+            </div>
+
         </div>
 
         <div class="tab-content" id="logs-tab">
