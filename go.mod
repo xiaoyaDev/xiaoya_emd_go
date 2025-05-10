@@ -3,7 +3,7 @@ module github.com/xiaoyaDev/xiaoya_emd_go
 go 1.24
 
 require (
-	github.com/miekg/dns v1.1.65
+	github.com/miekg/dns v1.1.66
 	golang.org/x/time v0.11.0
 )
 
