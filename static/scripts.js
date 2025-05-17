@@ -218,8 +218,8 @@ async function getSyncStatus() {
             intervalInput.dataset.initialized = 'true';
         }
         localTimestamp.textContent = config.scanListTime ? new Date(config.scanListTime).toLocaleString() : '未知';
-        startBtn.disabled = status.isRunning || status.syncingPath !== '';
-        stopBtn.disabled = !status.isRunning && status.syncingPath === '';
+        startBtn.disabled = status.isRunning;
+        stopBtn.disabled = !status.isRunning;
     } catch (error) {
         showStatus(`获取同步状态失败: ${error.message}`, true);
     }
@@ -263,9 +263,9 @@ async function loadPaths() {
             pathList.innerHTML += `<div class="path-count-message">${pathCountsMessage}</div>`;
         }
         allPaths.forEach(path => {
-            const localCount = pathCounts[path] >= 0 ? pathCounts[path] : '正在加载...';
+            const localCount = pathCounts[path] >= 0 ? pathCounts[path] : '请手动刷新本地数据...';
             const serverCount = serverCounts[path] >= 0 ? serverCounts[path] : '未知';
-            const diff = localCount !== '正在加载...' && serverCount !== '未知' ? localCount - serverCount : null;
+            const diff = localCount !== '请手动刷新本地数据...' && serverCount !== '未知' ? localCount - serverCount : null;
             let diffText = '';
             let diffClass = '';
             if (diff !== null) {
@@ -371,29 +371,12 @@ async function saveLogSize() {
     }
 }
 
-/*async function saveServers() {
-    const servers = document.getElementById('serverList').value.trim().split('\n').filter(s => s);
-    if (!servers.length) {
-        showStatus('服务器列表不能为空', true);
-        return;
-    }
-    try {
-        await fetchAPI('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sPool: servers })
-        });
-        showStatus(`服务器列表已保存 (${servers.length} 个)`);
-    } catch (error) {
-        showStatus(`保存失败: ${error.message}`, true);
-    }
-}
-*/
 async function loadConfigPage() {
     await loadServers();
     await loadDNSConfig();
     await loadBandwidthConfig();
     await loadConcurrencyConfig();
+    await loadMemoryConfig();
 }
 
 async function loadDNSConfig() {
@@ -617,10 +600,102 @@ async function clearRecycleBin() {
     }
 }
 
+// 加载内存限制配置
+async function loadMemoryConfig() {
+    try {
+        const config = await fetchAPI('/api/config/get');
+        document.getElementById('memoryLimitEnabled').checked = config.memoryLimitEnabled || false;
+        document.getElementById('memoryLimitMB').value = config.memoryLimitMB || 512;
+    } catch (error) {
+        showStatus(`加载内存配置失败: ${error.message}`, true);
+    }
+}
+
+// 切换内存限制开关
+async function toggleMemoryLimitEnabled() {
+    const checkbox = document.getElementById('memoryLimitEnabled');
+    const memoryLimitEnabled = checkbox.checked;
+    const memoryLimitMBInput = document.getElementById('memoryLimitMB');
+    let memoryLimitMB = parseFloat(memoryLimitMBInput.value);
+
+    if (isNaN(memoryLimitMB) || memoryLimitMB <= 0) {
+        memoryLimitMB = 512;
+    }
+
+    if (memoryLimitEnabled && memoryLimitMB <= 0) {
+        showStatus('内存限制值必须为正数', true);
+        checkbox.checked = false;
+        return;
+    }
+
+    try {
+        await fetchAPI('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ memoryLimitEnabled, memoryLimitMB })
+        });
+        showStatus(`内存限制已${memoryLimitEnabled ? '启用' : '关闭'}`);
+    } catch (error) {
+        showStatus(`保存内存限制失败: ${error.message}`, true);
+        checkbox.checked = !memoryLimitEnabled;
+    }
+}
+
+// 保存内存限制配置
+async function saveMemoryConfig() {
+    const checkbox = document.getElementById('memoryLimitEnabled');
+    const memoryLimitEnabled = checkbox.checked;
+    const memoryLimitMBInput = document.getElementById('memoryLimitMB');
+    let memoryLimitMB = parseFloat(memoryLimitMBInput.value);
+
+    if (isNaN(memoryLimitMB) || memoryLimitMB <= 0) {
+        memoryLimitMB = 512;
+    }
+
+    if (memoryLimitEnabled && memoryLimitMB <= 0) {
+        showStatus('内存限制值必须为正数', true);
+        return;
+    }
+
+    try {
+        await fetchAPI('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ memoryLimitEnabled, memoryLimitMB })
+        });
+        showStatus(`内存限制已保存: ${memoryLimitEnabled ? `${memoryLimitMB} MB` : '关闭'}`);
+    } catch (error) {
+        showStatus(`保存内存限制失败: ${error.message}`, true);
+    }
+}
+
+// 加载资源使用情况
+async function loadResourceUsage() {
+    try {
+        const data = await fetchAPI('/api/resources');
+        document.getElementById('cpuUsage').textContent = `${data.cpuUsagePercent}%`;
+        document.getElementById('memoryUsage').textContent = `${data.memoryUsageMB} MB`;
+        document.getElementById('goroutines').textContent = data.goroutines;
+    } catch (error) {
+        showStatus(`加载资源使用情况失败: ${error.message}`, true);
+    }
+}
+
+// 触发垃圾回收
+async function triggerGC() {
+    try {
+        const response = await fetchAPI('/api/resources?action=gc');
+        showStatus(response.message);
+        setTimeout(loadResourceUsage, 500); // 刷新资源使用情况
+    } catch (error) {
+        showStatus(`触发垃圾回收失败: ${error.message}`, true);
+    }
+}
 window.onload = () => {
     initTheme(); // 初始化主题
     getSyncStatus();
     loadPaths();
     loadRecycleBinCount();
     setInterval(getSyncStatus, 5000);
+    setInterval(loadResourceUsage, 3000);// 每 3 秒刷新资源使用情况
 };

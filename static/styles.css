@@ -51,8 +51,6 @@ body[data-theme="dark"] .sync-status { background: #3b4a5a; }
 .sync-running { color: var(--success); font-weight: bold; }
 .sync-running::before { content: ''; display: inline-block; width: 10px; height: 10px; border: 2px solid var(--success); border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; margin-right: 5px; }
 .sync-waiting { color: #6c757d; }
-.log-container { max-height: 300px; overflow-y: auto; background: #fafafa; border-radius: 6px; padding: 10px; font-family: 'Courier New', monospace; font-size: 0.8rem; line-height: 1.8; letter-spacing: 0.5px; }
-body[data-theme="dark"] .log-container { background: #2c3e50; }
 .log-entry { display: flex; padding: 5px 0; border-bottom: 1px solid #dee2e6; align-items: flex-start; }
 body[data-theme="dark"] .log-entry { border-bottom: 1px solid #4a5e74; }
 .log-timestamp { color: #6c757d; width: 170px; flex-shrink: 0; white-space: nowrap; margin-right: 10px; }
@@ -88,7 +86,7 @@ body[data-theme="dark"] .pagination span, body[data-theme="dark"] .pagination la
     .sync-interval { flex-direction: column; align-items: flex-start; }
     button { padding: 6px 10px; font-size: 0.8rem; }
     .sync-interval input { width: 50px; }
-    .log-container { max-height: 200px; }
+    .log-container { max-height: 200px;min-height: 100px;max-height: 60vh; }
     .log-timestamp { width: 140px; font-size: 0.7rem; margin-right: 8px; }
     .log-type { min-width: 40px; font-size: 0.7rem; }
     .checkbox-group { font-size: 0.8rem; flex-wrap: wrap; gap: 5px; }
@@ -102,7 +100,9 @@ body[data-theme="dark"] .pagination span, body[data-theme="dark"] .pagination la
     .pagination select { width: 100px; }
     .telegram-footer { padding: 15px;  font-size: 0.9rem;  min-height: 50px;}
     .telegram-icon {  width: 14px; height: 14px; }
-    .recycle-bin-status {flex-direction: column;align-items: flex-start;}/*回收站区域的样式*/
+    .recycle-bin-status {flex-direction: column; align-items: flex-start;}/*回收站区域的样式*/
+    .resource-monitor { flex-direction: column; align-items: stretch;}
+    .resource-item { min-width: 100%; margin-bottom: 10px;}
 }
 /*回收站区域的样式*/
 .recycle-bin-status {
@@ -183,4 +183,111 @@ body[data-theme="dark"] .telegram-link {
 }
 body[data-theme="dark"] .telegram-link:hover {
     color: #74c0fc;
+}
+
+/* 资源监控区域 */
+.resource-monitor {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px;
+    background: linear-gradient(135deg, #f1f3f5, #e9ecef);
+    border-radius: 8px;
+    gap: 10px;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+    transition: background 0.3s;
+}
+
+body[data-theme="dark"] .resource-monitor {
+    background: linear-gradient(135deg, #3b4a5a, #2c3e50);
+}
+
+.resource-item {
+    flex: 1;
+    min-width: 150px;
+    font-size: 0.9rem;
+    padding: 8px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.8);
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+    transition: transform 0.2s;
+}
+
+body[data-theme="dark"] .resource-item {
+    background: rgba(0, 0, 0, 0.3);
+    color: #e9ecef;
+}
+
+.resource-item:hover {
+    transform: translateY(-2px);
+}
+
+.resource-item strong {
+    color: var(--primary);
+    margin-right: 5px;
+}
+
+.resource-monitor button {
+    background: linear-gradient(135deg, #28a745, #218838);
+    color: white;
+}
+
+.resource-monitor button:hover:not(:disabled) {
+    background: linear-gradient(135deg, #218838, #1e7e34);
+}
+
+/* 日志显示框 */
+.log-container {
+    max-height: none; /* 移除固定 max-height */
+    height: 300px; /* 默认高度 */
+    min-height: 150px; /* 最小高度 */
+    max-height: 80vh; /* 最大高度，限制为视口高度的 80% */
+    overflow-y: auto;
+    background: #fafafa;
+    border-radius: 6px;
+    padding: 10px;
+    font-family: 'Courier New', monospace;
+    font-size: 0.8rem;
+    line-height: 1.8;
+    letter-spacing: 0.5px;
+    position: relative; /* 为拖动柄定位 */
+    resize: vertical; /* 仅允许垂直拉伸 */
+    border: 1px solid #dee2e6;
+    transition: border-color 0.3s;
+}
+
+body[data-theme="dark"] .log-container {
+    background: #2c3e50;
+    border-color: #4a5e74;
+}
+
+/* 拖动柄 */
+.log-resize-handle {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 8px;
+    background: linear-gradient(180deg, #dee2e6, #ced4da);
+    cursor: ns-resize;
+    border-bottom-left-radius: 6px;
+    border-bottom-right-radius: 6px;
+}
+
+body[data-theme="dark"] .log-resize-handle {
+    background: linear-gradient(180deg, #4a5e74, #3b4a5a);
+}
+
+.log-resize-handle:hover {
+    background: linear-gradient(180deg, #ced4da, #adb5bd);
+}
+
+body[data-theme="dark"] .log-resize-handle:hover {
+    background: linear-gradient(180deg, #3b4a5a, #2c3e50);
+}
+
+/* 拖动时的视觉反馈 */
+.log-container.dragging {
+    border-color: var(--primary);
 }

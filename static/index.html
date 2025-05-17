@@ -9,7 +9,7 @@
 </head>
 <body>
     <div class="container">
-        <h1>小雅爬虫管理 V1.5</h1>
+        <h1>小雅爬虫管理 V1.6</h1>
         <div class="top-controls">
             <button class="theme-toggle" onclick="toggleTheme()">切换主题</button>
         </div>
@@ -22,6 +22,22 @@
         </div>
 
         <div class="tab-content active" id="main-tab">
+            <div class="section">
+                <div class="section-title">资源使用情况</div>
+                <div id="resourceMonitor" class="resource-monitor">
+                    <div class="resource-item">
+                        <strong>CPU 使用率：</strong><span id="cpuUsage">加载中...</span>
+                    </div>
+                    <div class="resource-item">
+                        <strong>内存使用量：</strong><span id="memoryUsage">加载中...</span>
+                    </div>
+                    <div class="resource-item">
+                        <strong>Goroutines：</strong><span id="goroutines">加载中...</span>
+                    </div>
+                    <button class="primary" onclick="triggerGC()"><i class="fas fa-broom"></i> 释放内存</button>
+                </div>
+            </div>
+
             <div class="section">
                 <div class="section-title">同步状态</div>
                 <div id="syncStatus" class="sync-status">
@@ -59,7 +75,6 @@
                     <button class="danger" onclick="clearRecycleBin()"><i class="fas fa-trash"></i> 清空回收站</button>
                 </div>
             </div>
-
         </div>
 
         <div class="tab-content" id="logs-tab">
@@ -154,10 +169,18 @@ https://example2.com"></textarea>
                     <input type="number" id="maxConcurrency" min="1" step="1" placeholder="500">
                     <button class="primary" onclick="saveConcurrencyConfig()"><i class="fas fa-save"></i> 保存</button>
                 </div>
+                <div class="input-group">
+                    <label>启用内存限制：</label>
+                    <input type="checkbox" id="memoryLimitEnabled" onchange="toggleMemoryLimitEnabled()">
+                </div>
+                <div class="input-group">
+                    <label for="memoryLimitMB">内存限制 (MB)：</label>
+                    <input type="number" id="memoryLimitMB" min="100" step="10" placeholder="512">
+                    <button class="primary" onclick="saveMemoryConfig()"><i class="fas fa-save"></i> 保存</button>
+                </div>
             </div>
         </div>
     </div>
-    <script src="scripts.js"></script>
     <footer class="telegram-footer">
         <p>
             <a href="https://t.me/xiaoyaliu00" target="_blank" class="telegram-link">
@@ -165,5 +188,6 @@ https://example2.com"></textarea>
             </a>
         </p>
     </footer>
+    <script src="scripts.js"></script>
 </body>
 </html>

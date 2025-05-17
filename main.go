@@ -12,18 +12,21 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/shirou/gopsutil/cpu"
 	"golang.org/x/time/rate"
 )
 
@@ -53,6 +56,8 @@ type Config struct {
 	PathUpdateNotices     map[string]bool `json:"pathUpdateNotices"`
 	ServerPathCounts      map[string]int  `json:"serverPathCounts"`
 	LocalPathCounts       map[string]int  `json:"localPathCounts"`
+	MemoryLimitEnabled    bool            `json:"memoryLimitEnabled"` //内存限制开关
+	MemoryLimitMB         float64         `json:"memoryLimitMB"`      //内存限制（MB）
 }
 
 // LogEntry 定义日志条目结构
@@ -90,6 +95,11 @@ type FileInfoMap map[string]int64 // key: 路径, value: 时间戳
 type LocalFileInfo struct {
 	Files  FileInfoMap
 	Counts map[string]int
+}
+
+type ServerFileInfo struct {
+	Files  FileInfoMap    // 文件路径到时间戳的映射
+	Counts map[string]int // 路径到文件数量的映射
 }
 
 // 全局变量
@@ -504,6 +514,8 @@ func loadConfig() error {
 			PathUpdateNotices:     make(map[string]bool),
 			ServerPathCounts:      make(map[string]int),
 			LocalPathCounts:       make(map[string]int), // 初始化 LocalPathCounts
+			MemoryLimitEnabled:    false,                // 默认关闭内存限制
+			MemoryLimitMB:         512.0,                // 默认 512MB
 		}
 		configMu.Unlock()
 		addLog("info", fmt.Sprintf("配置文件 %s 和根目录配置文件均未找到，已创建默认配置", configFilePath))
@@ -534,6 +546,12 @@ func loadConfig() error {
 	}
 	if newConfig.LocalPathCounts == nil {
 		newConfig.LocalPathCounts = make(map[string]int)
+	}
+	if newConfig.MemoryLimitMB <= 0 {
+		newConfig.MemoryLimitMB = 512.0 // 默认 512MB
+	}
+	if !newConfig.MemoryLimitEnabled {
+		newConfig.MemoryLimitEnabled = false
 	}
 
 	logsMu.Lock()
@@ -771,6 +789,12 @@ func scanLocalFilesToMap(mediaDir string, paths []string) (*LocalFileInfo, error
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
+	// 检查内存限制
+	configMu.RLock()
+	memoryLimitEnabled := config.MemoryLimitEnabled
+	memoryLimitBytes := uint64(config.MemoryLimitMB * 1024 * 1024)
+	configMu.RUnlock()
+
 	// 并发扫描每个路径
 	for _, path := range paths {
 		wg.Add(1)
@@ -788,10 +812,20 @@ func scanLocalFilesToMap(mediaDir string, paths []string) (*LocalFileInfo, error
 				relativePath, _ := filepath.Rel(mediaDir, filePath)
 				relativePath = filepath.ToSlash(relativePath)
 
+				// 检查内存使用
+				if memoryLimitEnabled {
+					var memStats runtime.MemStats
+					runtime.ReadMemStats(&memStats)
+					if memStats.Alloc > memoryLimitBytes {
+						addLog("error", fmt.Sprintf("内存使用超过限制（%.2f MB），停止扫描路径 %s", config.MemoryLimitMB, p))
+						return fmt.Errorf("内存超限")
+					}
+				}
+
 				mu.Lock()
 				result.Files[relativePath] = info.ModTime().Unix()
-				count++
 				mu.Unlock()
+				count++
 
 				return nil
 			})
@@ -820,7 +854,7 @@ func scanLocalFilesToMap(mediaDir string, paths []string) (*LocalFileInfo, error
 }
 
 // compareAndPrepareSync 对比内存Map和服务器Map，返回需要更新和删除的文件
-func compareAndPrepareSync(localMap, serverMap FileInfoMap, paths []string) ([]FileInfo, []string, error) {
+func compareAndPrepareSync(localMap FileInfoMap, serverInfo *ServerFileInfo, paths []string) ([]FileInfo, []string, error) {
 	addLog("info", "开始差异对比")
 
 	toUpdate := make([]FileInfo, 0)
@@ -828,7 +862,7 @@ func compareAndPrepareSync(localMap, serverMap FileInfoMap, paths []string) ([]F
 	pathNotice := make(map[string]bool)
 
 	// 检查服务器文件更新
-	for path, serverTS := range serverMap {
+	for path, serverTS := range serverInfo.Files {
 		shouldSync := false
 		for _, prefix := range paths {
 			if strings.HasPrefix(path, prefix) {
@@ -859,7 +893,7 @@ func compareAndPrepareSync(localMap, serverMap FileInfoMap, paths []string) ([]F
 			continue
 		}
 
-		if _, exists := serverMap[path]; !exists {
+		if _, exists := serverInfo.Files[path]; !exists {
 			toDelete = append(toDelete, path)
 		}
 	}
@@ -1120,7 +1154,7 @@ func syncFiles(media *string) {
 			addLog("warning", fmt.Sprintf("清理临时文件失败：%v", err))
 		}
 
-		// 扫描本地文件（内存Map版本）
+		// 扫描本地文件（仅在必要时执行）
 		localMap, err := scanLocalFilesToMap(mediaDir, paths)
 		if err != nil {
 			addLog("error", fmt.Sprintf("生成本地文件映射失败：%v", err))
@@ -1186,11 +1220,29 @@ func syncFiles(media *string) {
 		}
 
 		// 生成服务器文件映射
-		serverMap, err := generateServerMap(scanListGzPath, paths)
+		serverInfo, err := generateServerMap(scanListGzPath, paths)
 		if err != nil {
 			addLog("error", fmt.Sprintf("生成服务器文件映射失败：%v", err))
 			continue
 		}
+		// 更新 ServerPathCounts
+		configMu.Lock()
+		if config.ServerPathCounts == nil {
+			config.ServerPathCounts = make(map[string]int)
+		}
+		for path, count := range serverInfo.Counts {
+			config.ServerPathCounts[path] = count
+		}
+		// 清理不存在的路径
+		for path := range config.ServerPathCounts {
+			if !contains(paths, path) {
+				delete(config.ServerPathCounts, path)
+			}
+		}
+		if err := saveConfig(); err != nil {
+			addLog("error", fmt.Sprintf("保存服务器路径计数失败：%v", err))
+		}
+		configMu.Unlock()
 
 		// 删除 .scan.list.gz
 		if err := os.Remove(scanListGzPath); err != nil && !os.IsNotExist(err) {
@@ -1198,7 +1250,7 @@ func syncFiles(media *string) {
 		}
 
 		// 对比差异
-		toUpdate, toDelete, err := compareAndPrepareSync(localMap.Files, serverMap, paths)
+		toUpdate, toDelete, err := compareAndPrepareSync(localMap.Files, serverInfo, paths)
 		if err != nil {
 			addLog("error", fmt.Sprintf("比较文件映射失败：%v", err))
 			continue
@@ -1214,12 +1266,12 @@ func syncFiles(media *string) {
 			}
 		}()
 
-		// 执行核心同步
-		successFiles, failedFiles, err := syncFilesCore(ctx, mediaDir, servers, toUpdate, toDelete, maxConcurrency, true)
+		// 执行核心同步，并获取路径计数变化
+		successFiles, failedFiles, pathCountChanges, err := syncFilesCore(ctx, mediaDir, servers, toUpdate, toDelete, maxConcurrency, true)
 		cancel()
 
-		// 更新本地路径计数
-		updateLocalPathCounts(localMap, paths)
+		// 增量更新本地路径计数
+		updateLocalPathCounts(pathCountChanges, paths)
 
 		// 处理同步结果
 		syncStateMu.Lock()
@@ -1275,7 +1327,7 @@ func syncFiles(media *string) {
 			configMu.RLock()
 			nextRun := time.Now().Add(time.Duration(config.Interval) * time.Hour)
 			configMu.RUnlock()
-
+			runtime.GC()
 			addLog("info", fmt.Sprintf("同步完成，进入等待状态，下次检测时间：%s", formatTime(nextRun)))
 
 			syncStateMu.Lock()
@@ -1304,8 +1356,8 @@ func syncFiles(media *string) {
 	}
 }
 
-// updateLocalPathCounts 使用内存Map更新本地路径计数
-func updateLocalPathCounts(localMap *LocalFileInfo, paths []string) {
+// updateLocalPathCounts 增量更新本地路径计数
+func updateLocalPathCounts(pathCountChanges map[string]int, paths []string) {
 	configMu.Lock()
 	defer configMu.Unlock()
 
@@ -1313,39 +1365,60 @@ func updateLocalPathCounts(localMap *LocalFileInfo, paths []string) {
 		config.LocalPathCounts = make(map[string]int)
 	}
 
-	// 直接使用传入的 LocalFileInfo 结构体中的计数
-	for path, count := range localMap.Counts {
-		config.LocalPathCounts[path] = count
-	}
+	// 记录是否需要保存配置
+	needSave := false
 
-	// 清理不再存在的路径
-	for path := range config.LocalPathCounts {
-		found := false
-		for _, p := range paths {
-			if p == path {
-				found = true
-				break
+	// 增量更新计数
+	for path, change := range pathCountChanges {
+		if change != 0 {
+			currentCount, exists := config.LocalPathCounts[path]
+			if !exists {
+				currentCount = 0
 			}
-		}
-		if !found {
-			delete(config.LocalPathCounts, path)
+			newCount := currentCount + change
+			if newCount < 0 {
+				addLog("warning", fmt.Sprintf("路径 %s 的计数变为负数（%d），重置为 0", path, newCount))
+				newCount = 0
+			}
+			config.LocalPathCounts[path] = newCount
+			needSave = true
 		}
 	}
 
-	// 保存配置
-	if err := saveConfig(); err != nil {
-		addLog("error", fmt.Sprintf("保存路径计数失败：%v", err))
+	// 清理不存在的路径
+	for path := range config.LocalPathCounts {
+		if !contains(paths, path) {
+			delete(config.LocalPathCounts, path)
+			needSave = true
+		}
+	}
+
+	// 仅在计数发生变化时保存配置
+	if needSave {
+		if err := saveConfig(); err != nil {
+			addLog("error", fmt.Sprintf("更新本地文件数量失败：%v", err))
+		} else {
+			addLog("info", "更新本地文件数量完成")
+		}
 	}
 }
 
-// syncFilesCore 执行文件同步核心逻辑
-func syncFilesCore(ctx context.Context, mediaDir string, servers []ServerInfo, toUpdate []FileInfo, toDelete []string, maxConcurrency int, deleteFiles bool) ([]FileInfo, []string, error) {
+// syncFilesCore 执行文件同步核心逻辑，并跟踪路径计数变化
+func syncFilesCore(ctx context.Context, mediaDir string, servers []ServerInfo, toUpdate []FileInfo, toDelete []string, maxConcurrency int, deleteFiles bool) ([]FileInfo, []string, map[string]int, error) {
 	startTime := time.Now()
 	var wg sync.WaitGroup
 	semaphore := make(chan struct{}, maxConcurrency)
 	successFiles := make([]FileInfo, 0, len(toUpdate))
 	failedFiles := make([]string, 0, len(toDelete)+len(toUpdate))
+	pathCountChanges := make(map[string]int) // 路径计数增减变化
 	var successMu, failedMu sync.Mutex
+
+	// 初始化路径计数变化
+	configMu.RLock()
+	for _, path := range config.SPathsAll {
+		pathCountChanges[path] = 0
+	}
+	configMu.RUnlock()
 
 	// 第一步：处理删除
 	if deleteFiles && len(toDelete) > 0 {
@@ -1354,7 +1427,7 @@ func syncFilesCore(ctx context.Context, mediaDir string, servers []ServerInfo, t
 			select {
 			case <-ctx.Done():
 				addLog("info", "核心同步文件删除被取消")
-				return successFiles, failedFiles, ctx.Err()
+				return successFiles, failedFiles, pathCountChanges, ctx.Err()
 			default:
 				wg.Add(1)
 				go func(p string) {
@@ -1367,11 +1440,18 @@ func syncFilesCore(ctx context.Context, mediaDir string, servers []ServerInfo, t
 						failedFiles = append(failedFiles, p)
 						failedMu.Unlock()
 						addLog("error", fmt.Sprintf("删除 %s 失败：%v", p, err))
+					} else {
+						rootDir := getRootDir(p)
+						if rootDir != "" {
+							successMu.Lock()
+							pathCountChanges[rootDir]--
+							successMu.Unlock()
+						}
 					}
 				}(path)
 			}
 		}
-		wg.Wait() // 等待删除完成
+		wg.Wait()
 		addLog("info", fmt.Sprintf("删除完成，成功 %d 个，失败 %d 个", len(toDelete)-len(failedFiles), len(failedFiles)))
 	}
 
@@ -1382,7 +1462,7 @@ func syncFilesCore(ctx context.Context, mediaDir string, servers []ServerInfo, t
 			select {
 			case <-ctx.Done():
 				addLog("info", "核心同步文件下载被取消")
-				return successFiles, failedFiles, ctx.Err()
+				return successFiles, failedFiles, pathCountChanges, ctx.Err()
 			default:
 				wg.Add(1)
 				go func(f FileInfo) {
@@ -1399,22 +1479,27 @@ func syncFilesCore(ctx context.Context, mediaDir string, servers []ServerInfo, t
 					} else {
 						successMu.Lock()
 						successFiles = append(successFiles, f)
+						rootDir := getRootDir(f.Path)
+						if rootDir != "" {
+							pathCountChanges[rootDir]++
+						}
 						successMu.Unlock()
 					}
 				}(file)
 			}
 		}
-		wg.Wait() // 等待下载完成
+		wg.Wait()
 	}
 
 	// 如果任务被取消，跳过后续处理
 	if ctx.Err() != nil {
 		addLog("info", fmt.Sprintf("核心同步被终止，耗时 %s", formatDuration(time.Since(startTime))))
-		return successFiles, failedFiles, ctx.Err()
+		return successFiles, failedFiles, pathCountChanges, ctx.Err()
 	}
 
-	addLog("success", fmt.Sprintf("核心同步完成，更新 %d 个文件，删除 %d 个文件，耗时 %s", len(successFiles), len(toDelete)-len(failedFiles), formatDuration(time.Since(startTime))))
-	return successFiles, failedFiles, nil
+	addLog("success", fmt.Sprintf("核心同步完成，更新 %d 个文件，删除 %d 个文件，耗时 %s",
+		len(successFiles), len(toDelete)-len(failedFiles), formatDuration(time.Since(startTime))))
+	return successFiles, failedFiles, pathCountChanges, nil
 }
 
 // getRootDir 获取文件路径的根目录
@@ -1492,9 +1577,10 @@ func checkAndUpdateScanList(serverURL, localPath string) (bool, time.Time, error
 }
 
 // generateServerMap 解析.gz文件生成内存Map
-func generateServerMap(gzPath string, activePaths []string) (FileInfoMap, error) {
+func generateServerMap(gzPath string, activePaths []string) (*ServerFileInfo, error) {
 	startTime := time.Now()
 	fileMap := make(FileInfoMap)
+	counts := make(map[string]int) // 路径计数
 
 	gzFile, err := os.Open(gzPath)
 	if err != nil {
@@ -1526,13 +1612,18 @@ func generateServerMap(gzPath string, activePaths []string) (FileInfoMap, error)
 		for _, path := range activePaths {
 			if strings.HasPrefix(filePath, path) {
 				fileMap[filePath] = t.Unix()
+				counts[path]++ // 路径计数
 				break
 			}
 		}
 	}
 	addLog("success", fmt.Sprintf("服务器数据生成完成，共 %d 条记录，耗时 %s",
 		len(fileMap), formatDuration(time.Since(startTime))))
-	return fileMap, nil
+
+	return &ServerFileInfo{
+		Files:  fileMap,
+		Counts: counts,
+	}, nil
 }
 
 // formatDuration 格式化时间间隔，保留小数点后两位
@@ -1569,12 +1660,14 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 		BandwidthLimitEnabled *bool     `json:"bandwidthLimitEnabled,omitempty"`
 		BandwidthLimitMBps    *float64  `json:"bandwidthLimitMBps,omitempty"`
 		MaxConcurrency        *int      `json:"maxConcurrency,omitempty"`
+		MemoryLimitEnabled    *bool     `json:"memoryLimitEnabled,omitempty"` // 新增
+		MemoryLimitMB         *float64  `json:"memoryLimitMB,omitempty"`      // 新增
 	}
 	if err := json.NewDecoder(r.Body).Decode(&newConfig); err != nil {
 		http.Error(w, "解析JSON数据失败", http.StatusBadRequest)
 		return
 	}
-	if newConfig.SPathsAll == nil && newConfig.SPool == nil && newConfig.ActivePaths == nil && newConfig.Interval == nil && newConfig.DNSType == nil && newConfig.DNSServer == nil && newConfig.DNSEnabled == nil && newConfig.LogSize == nil && newConfig.BandwidthLimitEnabled == nil && newConfig.BandwidthLimitMBps == nil && newConfig.MaxConcurrency == nil {
+	if newConfig.SPathsAll == nil && newConfig.SPool == nil && newConfig.ActivePaths == nil && newConfig.Interval == nil && newConfig.DNSType == nil && newConfig.DNSServer == nil && newConfig.DNSEnabled == nil && newConfig.LogSize == nil && newConfig.BandwidthLimitEnabled == nil && newConfig.BandwidthLimitMBps == nil && newConfig.MaxConcurrency == nil && newConfig.MemoryLimitEnabled == nil && newConfig.MemoryLimitMB == nil {
 		http.Error(w, "至少需要提供一个配置字段", http.StatusBadRequest)
 		return
 	}
@@ -1597,7 +1690,6 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		config.Interval = *newConfig.Interval
 		addLog("info", fmt.Sprintf("同步间隔更新为 %d 小时", config.Interval))
-		// 通知 syncFiles 重启 ticker
 		select {
 		case intervalChange <- *newConfig.Interval:
 		default:
@@ -1687,6 +1779,19 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		config.MaxConcurrency = *newConfig.MaxConcurrency
 		addLog("info", fmt.Sprintf("最大并发数更新为 %d", config.MaxConcurrency))
+	}
+	if newConfig.MemoryLimitEnabled != nil {
+		config.MemoryLimitEnabled = *newConfig.MemoryLimitEnabled
+		addLog("info", fmt.Sprintf("内存限制已设置为 %v", config.MemoryLimitEnabled))
+	}
+	if newConfig.MemoryLimitMB != nil {
+		if *newConfig.MemoryLimitMB <= 0 {
+			configMu.Unlock()
+			http.Error(w, "内存限制必须为正数", http.StatusBadRequest)
+			return
+		}
+		config.MemoryLimitMB = *newConfig.MemoryLimitMB
+		addLog("info", fmt.Sprintf("内存限制值更新为 %.2f MB", config.MemoryLimitMB))
 	}
 	configMu.Unlock()
 
@@ -2164,6 +2269,63 @@ func handleResetScanListTime(w http.ResponseWriter, r *http.Request) {
 		"message": "数据包时间已重置，已触发同步",
 	})
 }
+
+// handleResources 返回当前资源使用情况或触发垃圾回收
+func handleResources(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	action := r.URL.Query().Get("action")
+
+	if action == "gc" {
+		runtime.GC()
+		addLog("info", "手动触发垃圾回收")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "垃圾回收已触发"})
+		return
+	}
+
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
+	// 内存使用（分配的堆内存，单位 MB）
+	memUsageMB := float64(memStats.Alloc) / (1024 * 1024)
+
+	// CPU 使用率
+	cpuCores := runtime.NumCPU()
+	percents, err := cpu.Percent(100*time.Millisecond, true)
+	if err != nil {
+		addLog("warning", fmt.Sprintf("获取 CPU 使用率失败：%v", err))
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"cpuUsagePercent": 0,
+			"memoryUsageMB":   math.Round(memUsageMB*100) / 100,
+			"goroutines":      runtime.NumGoroutine(),
+			"cpuCores":        cpuCores,
+			"cpuDetails":      make([]float64, cpuCores),
+		})
+		return
+	}
+
+	// 计算总 CPU 使用率
+	var totalPercent float64
+	coreUsage := make([]float64, cpuCores)
+	for i, percent := range percents {
+		if i < cpuCores {
+			coreUsage[i] = math.Round(percent*100) / 100
+			totalPercent += percent
+		}
+	}
+	cpuUsagePercent := math.Round(totalPercent/float64(cpuCores)*100) / 100
+	if cpuUsagePercent > 100 {
+		cpuUsagePercent = 100
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"cpuUsagePercent": cpuUsagePercent,
+		"memoryUsageMB":   math.Round(memUsageMB*100) / 100,
+		"goroutines":      runtime.NumGoroutine(),
+		"cpuCores":        cpuCores,
+		"cpuDetails":      coreUsage,
+	})
+}
+
 func main() {
 	var err error
 	shanghaiLoc, err = time.LoadLocation("Asia/Shanghai")
@@ -2288,6 +2450,7 @@ func main() {
 	http.HandleFunc("/api/recycle-bin/clear", handleRecycleBinClear)
 	http.HandleFunc("/api/recycle-bin/list", handleRecycleBinList)
 	http.HandleFunc("/api/reset-scanlist-time", handleResetScanListTime)
+	http.HandleFunc("/api/resources", handleResources)
 	http.Handle("/", fs)
 
 	addr := fmt.Sprintf(":%d", *port)
