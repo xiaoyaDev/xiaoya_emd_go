@@ -5,7 +5,7 @@ go 1.24
 require (
 	github.com/miekg/dns v1.1.65
 	github.com/shirou/gopsutil v3.21.11+incompatible
-	golang.org/x/time v0.11.0
+	golang.org/x/time v0.12.0
 )
 
 require (
