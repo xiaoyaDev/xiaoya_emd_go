@@ -12,7 +12,7 @@ COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux go build -v -x -ldflags="-s -w" -o xiaoya_emd main.go
 
-FROM alpine:3.22
+FROM alpine:3.23
 
 ENV TZ=Asia/Shanghai
 
