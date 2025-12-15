@@ -7,7 +7,7 @@ toolchain go1.24.7
 require (
 	github.com/miekg/dns v1.1.69
 	github.com/shirou/gopsutil v3.21.11+incompatible
-	golang.org/x/time v0.13.0
+	golang.org/x/time v0.14.0
 )
 
 require (
