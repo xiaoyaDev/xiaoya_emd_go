@@ -2,7 +2,7 @@ module github.com/xiaoyaDev/xiaoya_emd_go
 
 go 1.24.0
 
-toolchain go1.24.7
+toolchain go1.25.5
 
 require (
 	github.com/miekg/dns v1.1.69
