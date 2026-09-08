@@ -1,13 +1,11 @@
 module github.com/xiaoyaDev/xiaoya_emd_go
 
-go 1.24.0
-
-toolchain go1.24.7
+go 1.26.0
 
 require (
 	github.com/miekg/dns v1.1.69
 	github.com/shirou/gopsutil v3.21.11+incompatible
-	golang.org/x/time v0.14.0
+	golang.org/x/time v0.16.0
 )
 
 require (
